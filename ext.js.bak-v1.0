@@ -1,0 +1,222 @@
+// ============ РАСШИРЕНИЕ: видит страницу + автопилот ============
+const AP_MAX_STEPS = 20;
+let apStep = 0, apStop = false;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+if(settings.seePage === undefined) settings.seePage = true;
+
+const AP_PROMPT = `Ты AI-ассистент в боковой панели браузера и видишь открытую вкладку (блок [СТРАНИЦА] в сообщении пользователя).
+Если пользователь спрашивает о странице — отвечай по её содержимому.
+АВТОПИЛОТ: если пользователь просит что-то СДЕЛАТЬ на странице (может быть НЕСКОЛЬКО задач сразу) — выполняй задачи по порядку, шаг за шагом.
+Действия (используй НОМЕРА элементов из списка «Элементы», не придумывай селекторы):
+- [TYPE: 5 | текст] — ввести текст в поле №5 (можно несколько TYPE в одном ответе);
+- [ENTER: 5] — нажать Enter в поле №5 (например, отправить поиск);
+- [CLICK: 12] — кликнуть по элементу №12 (не больше одного CLICK за ответ, выполняется после TYPE);
+- [OPEN: https://...] — открыть адрес в текущей вкладке;
+- [SCROLL: down] или [SCROLL: up] — прокрутить страницу.
+После каждого шага ты автоматически получишь обновлённую страницу и продолжишь.
+Формат: «Задача N из M: …» + короткое пояснение + действия.
+[DONE] — только когда ВСЕ задачи выполнены (с кратким итогом). Нет подходящего элемента → напиши ERROR и причину.
+На обычные вопросы отвечай без действий.`;
+
+async function getTargetTab(){
+  const ok = t => t && /^(https?|file):/.test(t.url||"");
+  // 1) боковая панель: активная вкладка этого же окна
+  let [tab] = await chrome.tabs.query({active:true, currentWindow:true});
+  if(ok(tab)) return tab;
+  // 2) отдельное окно: активная вкладка последнего обычного окна браузера
+  try{
+    const w = await chrome.windows.getLastFocused({windowTypes:["normal"]});
+    const [t2] = await chrome.tabs.query({active:true, windowId:w.id});
+    if(t2) return t2;
+  }catch{}
+  const all = await chrome.tabs.query({active:true, windowType:"normal"});
+  return all.find(ok) || all[0] || tab;
+}
+
+async function pageSnapshot(){
+  try{
+    const tab = await getTargetTab();
+    if(!tab || !/^(https?|file):/.test(tab.url||"")) return {blocked:true, url:tab?.url||"", title:tab?.title||""};
+    const [res] = await chrome.scripting.executeScript({target:{tabId:tab.id}, func:()=>{
+      const vis = el => { const r = el.getBoundingClientRect(), s = getComputedStyle(el);
+        return r.width>0 && r.height>0 && s.visibility!=="hidden" && s.display!=="none"; };
+      document.querySelectorAll("[data-ai-id]").forEach(e=>e.removeAttribute("data-ai-id"));
+      const q = 'a[href],button,input:not([type="hidden"]),select,textarea,summary,[contenteditable="true"],[role="button"],[role="link"],[role="tab"],[role="menuitem"],[role="checkbox"],[role="option"],[role="textbox"],[role="combobox"],[onclick]';
+      const items = []; let n = 0;
+      for(const el of document.querySelectorAll(q)){
+        if(!vis(el) || el.disabled) continue;
+        const tag = el.tagName.toLowerCase();
+        const kind = tag==="input" ? `input:${el.type||"text"}` : tag;
+        const t = (el.innerText || el.value || el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("placeholder") || el.getAttribute("alt") || el.querySelector?.("img")?.alt || el.name || "")
+          .trim().replace(/\s+/g," ").slice(0,80);
+        if(!t && !/input|textarea|select/.test(kind)) continue;
+        el.setAttribute("data-ai-id", String(++n));
+        items.push(`${n} | <${kind}> ${t || "(пустое поле)"}`);
+        if(n >= 200) break;
+      }
+      return {url:location.href, title:document.title, text:document.body.innerText.replace(/\n{3,}/g,"\n\n").slice(0,10000), items:items.join("\n")};
+    }});
+    return res?.result || null;
+  }catch(e){ return {blocked:true, error:e.message}; }
+}
+
+async function actOnPage(kind, target, value){
+  const tab = await getTargetTab();
+  if(kind === "open"){ await chrome.tabs.update(tab.id, {url:target}); return {ok:true, msg:target}; }
+  const [res] = await chrome.scripting.executeScript({target:{tabId:tab.id}, args:[kind, String(target||"").trim(), value ?? ""], func:(kind, t, v)=>{
+    if(kind === "scroll"){ window.scrollBy({top:(t==="up"?-1:1)*innerHeight*0.8, behavior:"instant"}); return {ok:true, msg:t}; }
+    const s = t.replace(/^[`'"#№]+|[`'"]+$/g,"");
+    let el = /^\d+$/.test(s) ? document.querySelector(`[data-ai-id="${s}"]`) : null;
+    if(!el){ try{ el = document.querySelector(s); }catch{} }
+    if(!el){ const low = s.toLowerCase(); el = [...document.querySelectorAll("a,button,[role=button],input,label,summary")]
+      .find(e => (e.innerText||e.value||e.getAttribute("aria-label")||"").trim().toLowerCase() === low); }
+    if(!el) return {ok:false, msg:"элемент не найден"};
+    el.scrollIntoView({block:"center"});
+    const name = (el.innerText||el.value||el.getAttribute("aria-label")||el.placeholder||el.tagName).trim().slice(0,50);
+    if(kind === "type"){
+      el.focus();
+      if(el.isContentEditable){ document.execCommand("selectAll"); document.execCommand("insertText", false, v); }
+      else {
+        const proto = el.tagName==="TEXTAREA" ? HTMLTextAreaElement.prototype : el.tagName==="SELECT" ? HTMLSelectElement.prototype : HTMLInputElement.prototype;
+        const set = Object.getOwnPropertyDescriptor(proto, "value")?.set; set ? set.call(el, v) : (el.value = v);
+      }
+      el.dispatchEvent(new Event("input", {bubbles:true})); el.dispatchEvent(new Event("change", {bubbles:true}));
+      return {ok:true, msg:`${name}: «${v.slice(0,40)}»`};
+    }
+    if(kind === "enter"){
+      el.focus();
+      const o = {key:"Enter", code:"Enter", keyCode:13, which:13, bubbles:true, cancelable:true};
+      el.dispatchEvent(new KeyboardEvent("keydown", o)); el.dispatchEvent(new KeyboardEvent("keypress", o)); el.dispatchEvent(new KeyboardEvent("keyup", o));
+      if(el.form && !el.isContentEditable){ el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit(); }
+      return {ok:true, msg:name};
+    }
+    // click: полная цепочка событий — React/Vue часто слушают pointerdown/mousedown
+    const r = el.getBoundingClientRect();
+    const o = {bubbles:true, cancelable:true, view:window, clientX:r.left+r.width/2, clientY:r.top+r.height/2};
+    const old = el.style.outline; el.style.outline = "3px solid #ff5d73"; setTimeout(()=>el.style.outline = old, 1200);
+    el.dispatchEvent(new PointerEvent("pointerdown", o)); el.dispatchEvent(new MouseEvent("mousedown", o));
+    el.focus?.();
+    el.dispatchEvent(new PointerEvent("pointerup", o)); el.dispatchEvent(new MouseEvent("mouseup", o));
+    el.click();
+    return {ok:true, msg:name};
+  }});
+  return res?.result || {ok:false, msg:"нет результата"};
+}
+
+async function waitTabIdle(){
+  await sleep(700);
+  try{ const tab = await getTargetTab();
+    for(let i=0; i<40; i++){ const t = await chrome.tabs.get(tab.id); if(t.status === "complete") break; await sleep(250); } }catch{}
+  await sleep(500);
+}
+
+// --- хуки в основной код чата ---
+window.HOOKS = {
+  async transformMessages(msgs){
+    if(!settings.seePage) return msgs;
+    const snap = await pageSnapshot();
+    const sys = msgs[0]?.role === "system" ? msgs[0] : null;
+    if(sys) sys.content = AP_PROMPT + "\n\n" + sys.content; else msgs.unshift({role:"system", content:AP_PROMPT});
+    let ctx;
+    if(!snap) ctx = "\n\n[СТРАНИЦА]\n(не удалось прочитать страницу)";
+    else if(snap.blocked) ctx = `\n\n[СТРАНИЦА]\n${snap.title||""}\n${snap.url||""}\n(браузер не разрешает расширениям читать эту страницу${snap.error?": "+snap.error:""})`;
+    else ctx = `\n\n[СТРАНИЦА]\n${snap.title}\n${snap.url}\n\nТекст:\n${snap.text}\n\nЭлементы:\n${snap.items || "(нет)"}`;
+    for(let i = msgs.length-1; i >= 0; i--){
+      if(msgs[i].role !== "user") continue;
+      if(typeof msgs[i].content === "string") msgs[i].content += ctx;
+      else { const t = msgs[i].content.find(p => p.type === "text"); t ? t.text += ctx : msgs[i].content.unshift({type:"text", text:ctx}); }
+      break;
+    }
+    return msgs;
+  },
+
+  async afterGenerate(c, msg, aborted){
+    if(aborted || msg.error || !settings.seePage){ apStep = 0; return; }
+    let text = msg.content || "";
+    const log = []; let acted = false, failed = false;
+    const re = {
+      type:  /\[TYPE:\s*([^|\]\n]+?)\s*\|\s*([^\]\n]*)\]/g,
+      enter: /\[ENTER:\s*([^\]\n]+?)\s*\]/g,
+      click: /\[CLICK:\s*([^\[\]\n]*(?:\[[^\]]*\][^\[\]\n]*)*)\]/,
+      open:  /\[OPEN:\s*(https?:\/\/[^\]\s]+)\s*\]/,
+      scroll:/\[SCROLL:\s*(up|down)\s*\]/i
+    };
+    const run = async (kind, m, target, value, icon) => {
+      try{ const r = await actOnPage(kind, target, value);
+        log.push(r.ok ? `${icon} ${r.msg}` : `⚠️ ${kind} ${target}: ${r.msg}`); r.ok ? acted = true : failed = true;
+      }catch(e){ log.push(`⚠️ ${kind}: ${e.message}`); failed = true; }
+      text = text.replace(m[0], "");
+    };
+    for(const m of [...text.matchAll(re.type)]) await run("type", m, m[1], m[2], "⌨️");
+    for(const m of [...text.matchAll(re.enter)]) await run("enter", m, m[1], "", "↵");
+    let m;
+    if((m = text.match(re.click))) await run("click", m, m[1], "", "🖱");
+    else if((m = text.match(re.open))) await run("open", m, m[1], "", "🌐");
+    else if((m = text.match(re.scroll))) await run("scroll", m, m[1].toLowerCase(), "", "↕️");
+    const done = /\[DONE\]/.test(text) || /\bERROR\b/.test(text);
+    if(!log.length && !done){ apStep = 0; return; }        // обычный ответ без действий
+    text = text.replace("[DONE]", "").trim();
+    if(log.length) text += "\n\n" + log.map(l => "`"+l+"`").join("  \n");
+    if(/\[DONE\]/.test(msg.content)) text += "\n\n✅ Готово!";
+    msg.content = text; await persist(c); renderMessages();
+    if(done || !acted || failed && !acted){ apStep = 0; return; }
+    if(++apStep >= AP_MAX_STEPS){ apStep = 0; toast("Лимит шагов — напишите «продолжай»"); return; }
+    // пауза между шагами: кнопка ⏹ работает и здесь
+    apStop = false;
+    controller = new AbortController(); controller.signal.onabort = () => apStop = true; updateSendBtn();
+    await waitTabIdle();
+    controller = null; updateSendBtn();
+    if(apStop || current() !== c){ apStep = 0; return; }
+    c.messages.push({role:"user", auto:true, time:Date.now(), content:
+      `(автопилот: шаг ${apStep} выполнен) Посмотри на обновлённую страницу, проверь результат и продолжай со следующей невыполненной задачи. Когда ВСЕ задачи выполнены — итог + [DONE].`});
+    await persist(c);
+    generate();
+  }
+};
+
+// новый запрос пользователя сбрасывает счётчик шагов
+document.getElementById("sendBtn").addEventListener("click", () => { if(!controller) apStep = 0; }, true);
+document.getElementById("input").addEventListener("keydown", e => { if(e.key==="Enter" && !e.shiftKey) apStep = 0; }, true);
+
+// --- меню «＋»: файл, скриншот, видеть страницу, размышления ---
+if(settings.think === undefined) settings.think = false;
+const plusBtn = document.getElementById("plusBtn"), plusMenu = document.getElementById("plusMenu");
+const closeMenu = () => { plusMenu.classList.remove("show"); plusBtn.classList.remove("open"); };
+plusBtn.onclick = e => { e.stopPropagation(); plusMenu.classList.toggle("show"); plusBtn.classList.toggle("open"); };
+document.addEventListener("click", e => { if(!e.target.closest(".plus-wrap")) closeMenu(); });
+document.addEventListener("keydown", e => { if(e.key === "Escape") closeMenu(); });
+
+const MODES = {
+  seePage: {btn:"seePageBtn", chip:"👁 Страница", on:"👁 ИИ видит страницу и может действовать", off:"Страница скрыта от ИИ"},
+  think:   {btn:"thinkBtn",   chip:"💭 Размышления", on:"💭 Размышления включены: модель сначала думает", off:"Размышления выключены"}
+};
+function paintModes(){
+  const chips = document.getElementById("modeChips"); chips.innerHTML = "";
+  for(const [k, m] of Object.entries(MODES)){
+    document.getElementById(m.btn).classList.toggle("on", !!settings[k]);
+    if(!settings[k]) continue;
+    const c = document.createElement("span"); c.className = "mode-chip";
+    c.innerHTML = `${m.chip}<button title="Выключить">×</button>`;
+    c.querySelector("button").onclick = () => toggleMode(k);
+    chips.appendChild(c);
+  }
+}
+function toggleMode(k){ settings[k] = !settings[k]; saveSettingsLS(); paintModes(); toast(settings[k] ? MODES[k].on : MODES[k].off); }
+for(const k of Object.keys(MODES)) document.getElementById(MODES[k].btn).onclick = e => { e.stopPropagation(); toggleMode(k); };
+document.getElementById("attachBtn").addEventListener("click", closeMenu);
+paintModes();
+
+// размышления: OpenRouter использует reasoning, остальные OpenAI-совместимые: reasoning_effort
+HOOKS.transformBody = (body, provider) => {
+  if(!settings.think) return;
+  if(provider === "openrouter") body.reasoning = {effort:"high"};
+  else body.reasoning_effort = "high";
+};
+
+document.getElementById("shotBtn").onclick = async () => {
+  closeMenu();
+  try{ const tab = await getTargetTab();
+    const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, {format:"jpeg", quality:75});
+    pending.push({type:"image", name:"screenshot.jpg", dataUrl: await compressImage(dataUrl)}); renderPending(); toast("📸 Скриншот добавлен");
+  }catch(e){ toast("Не удалось сделать скриншот: "+e.message); }
+};
