@@ -25,11 +25,15 @@ const PROVIDERS = {
 };
 const DEFAULTS = {
   provider:"anymodel", model:"cx/gpt-5.6-luna", customModel:"",
-  keys:{anymodel:"",openrouter:"",nyxos:"",xkiro:"",tooken:"",ghostly:""},
-  baseUrls:{}, fetchedModels:{},
+  keys:{anymodel:"",darkapi:"",openrouter:"",nyxos:"",xkiro:"",tooken:"",ghostly:""},
+  baseUrls:{}, fetchedModels:{}, customProviders:{},
   system:"", temperature:0.7, maxTokens:"", context:0, stream:true, autoTitle:true,
   syncUrl:"", syncKey:"", syncCode:""
 };
+
+function allProviders(src = settings){ return {...PROVIDERS, ...(src?.customProviders||{})}; }
+function providerOf(p, src = settings){ return allProviders(src)[p]; }
+function isCustomProvider(p, src = settings){ return !!(src?.customProviders && src.customProviders[p]); }
 
 // ============ СОСТОЯНИЕ ============
 const $ = s => document.querySelector(s);
@@ -40,13 +44,25 @@ let pending = [];         // вложения до отправки
 let controller = null;    // AbortController текущего запроса
 
 function loadSettings(){
-  try{ const s = JSON.parse(localStorage.getItem("aichat_settings")||"{}");
-    return {...structuredClone(DEFAULTS), ...s, keys:{...DEFAULTS.keys, ...(s.keys||{})}}; }
-  catch{ return structuredClone(DEFAULTS); }
+  try{
+    const s = JSON.parse(localStorage.getItem("aichat_settings")||"{}");
+    const merged = {
+      ...structuredClone(DEFAULTS), ...s,
+      keys:{...DEFAULTS.keys, ...(s.keys||{})},
+      baseUrls:{...(s.baseUrls||{})},
+      fetchedModels:{...(s.fetchedModels||{})},
+      customProviders:{...(s.customProviders||{})}
+    };
+    if(!allProviders(merged)[merged.provider]){
+      merged.provider = "anymodel";
+      merged.model = PROVIDERS.anymodel.models[0];
+    }
+    return merged;
+  }catch{ return structuredClone(DEFAULTS); }
 }
 function saveSettingsLS(){ localStorage.setItem("aichat_settings", JSON.stringify(settings)); }
-const baseUrlOf = p => (settings.baseUrls[p] || PROVIDERS[p].baseUrl).replace(/\/+$/,"");
-const modelsOf = p => { const f = settings.fetchedModels[p]; const base = PROVIDERS[p].models.filter(Boolean);
+const baseUrlOf = (p, src = settings) => (src.baseUrls?.[p] || providerOf(p, src)?.baseUrl || "").replace(/\/+$/,"");
+const modelsOf = (p, src = settings) => { const f = src.fetchedModels?.[p]; const base = (providerOf(p, src)?.models || []).filter(Boolean);
   return f && f.length ? [...new Set([...base, ...f])] : base; };
 const activeModel = () => settings.customModel.trim() || settings.model;
 
@@ -149,7 +165,7 @@ function updateTitle(){ const c = current(); $("#chatTitle").textContent = c ? c
 function renderMessages(){
   const box = $("#messages"); const c = current();
   if(!c || !c.messages.length){
-    box.innerHTML = `<div class="empty"><h1>Чем могу помочь?</h1><div>${esc(PROVIDERS[settings.provider].name)} · ${esc(activeModel())}</div></div>`; return;
+    box.innerHTML = `<div class="empty"><h1>Чем могу помочь?</h1><div>${esc(providerOf(settings.provider)?.name || settings.provider)} · ${esc(activeModel() || "модель не выбрана")}</div></div>`; return;
   }
   box.innerHTML = `<div class="msg-wrap"></div>`;
   const wrap = box.firstChild;
@@ -296,11 +312,14 @@ function buildApiMessages(c){
 
 async function generate(){
   const c = current(); const p = settings.provider; const key = settings.keys[p]; const model = activeModel();
+  const pDef = providerOf(p);
   const msg = {role:"assistant", content:"", reasoning:"", model, time:Date.now()};
   c.messages.push(msg);
   renderMessages();
   const el = $("#messages .msg-wrap").lastElementChild; const bodyEl = el.querySelector(".body");
-  if(!key){ msg.error = `Не указан API-ключ для «${PROVIDERS[p].name}». Откройте ⚙️ Настройки → API-ключи.`; bodyEl.innerHTML = assistantBody(msg); await persist(c); return; }
+  if(!pDef){ msg.error = `Провайдер «${p}» не найден. Выберите провайдера в ⚙️ Настройках.`; bodyEl.innerHTML = assistantBody(msg); await persist(c); return; }
+  if(!key && !isCustomProvider(p)){ msg.error = `Не указан API-ключ для «${pDef.name}». Откройте ⚙️ Настройки → API-ключи.`; bodyEl.innerHTML = assistantBody(msg); await persist(c); return; }
+  if(!model){ msg.error = `Не выбрана модель для «${pDef.name}». Загрузите список моделей или введите ID модели вручную в ⚙️ Настройках.`; bodyEl.innerHTML = assistantBody(msg); await persist(c); return; }
 
   controller = new AbortController(); updateSendBtn();
   bodyEl.classList.add("cursor");
@@ -313,7 +332,8 @@ async function generate(){
   if(settings.maxTokens) body.max_tokens = +settings.maxTokens;
   if(window.HOOKS?.transformMessages){ try{ body.messages = await HOOKS.transformMessages(body.messages, c); }catch(e){ console.warn(e); } }
   if(window.HOOKS?.transformBody) HOOKS.transformBody(body, p);
-  const headers = {"Content-Type":"application/json", "Authorization":"Bearer "+key};
+  const headers = {"Content-Type":"application/json"};
+  if(key) headers["Authorization"] = "Bearer "+key;
   if(p==="openrouter"){ headers["HTTP-Referer"] = location.origin.startsWith("http") ? location.origin : "https://localhost"; headers["X-Title"] = "AI Chat HTML"; }
 
   let aborted = false;
@@ -369,16 +389,23 @@ async function generate(){
 }
 
 // ============ ВЕРХНЯЯ ПАНЕЛЬ ============
-function fillProviderSelect(sel, val){ sel.innerHTML = Object.entries(PROVIDERS).map(([k,v])=>`<option value="${k}">${esc(v.name)}</option>`).join(""); sel.value = val; }
-function fillModelSelect(sel, p, val){
-  const list = modelsOf(p); if(val && !list.includes(val)) list.unshift(val);
-  sel.innerHTML = list.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join(""); sel.value = val || list[0];
+function fillProviderSelect(sel, val, src = settings){
+  const provs = allProviders(src);
+  sel.innerHTML = Object.entries(provs).map(([k,v])=>`<option value="${esc(k)}">${esc(v.name)}</option>`).join("");
+  sel.value = provs[val] ? val : Object.keys(provs)[0];
+}
+function fillModelSelect(sel, p, val, src = settings){
+  const list = modelsOf(p, src); if(val && !list.includes(val)) list.unshift(val);
+  sel.innerHTML = list.length
+    ? list.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join("")
+    : `<option value="">(нет моделей — загрузите или введите вручную)</option>`;
+  sel.value = val || list[0] || "";
 }
 function refreshTop(){
   fillProviderSelect($("#providerSel"), settings.provider);
   const ms = $("#modelSel"); fillModelSelect(ms, settings.provider, activeModel());
 }
-$("#providerSel").onchange = e=>{ settings.provider = e.target.value; settings.customModel=""; settings.model = modelsOf(settings.provider)[0]; saveSettingsLS(); refreshTop(); if(!current()?.messages.length) renderMessages(); };
+$("#providerSel").onchange = e=>{ settings.provider = e.target.value; settings.customModel=""; settings.model = modelsOf(settings.provider)[0] || ""; saveSettingsLS(); refreshTop(); if(!current()?.messages.length) renderMessages(); };
 $("#modelSel").onchange = e=>{ settings.model = e.target.value; settings.customModel=""; saveSettingsLS(); if(!current()?.messages.length) renderMessages(); };
 $("#toggleSide").onclick = ()=>$("#sidebar").classList.toggle("hidden");
 $("#newChat").onclick = ()=>{ const c=current(); if(c && !c.messages.length) return input.focus(); newChat(); };
@@ -386,16 +413,49 @@ $("#search").oninput = renderList;
 
 // ============ НАСТРОЙКИ ============
 let draft;
+let editingProvId = null;
+
+function syncKeysToDraft(){
+  document.querySelectorAll("[data-key]").forEach(i=> { draft.keys[i.dataset.key] = i.value.trim(); });
+}
+function renderKeysPane(){
+  const provs = allProviders(draft);
+  $("#keysPane").innerHTML = Object.entries(provs).map(([k,v])=>`
+    <div class="field"><label>${esc(v.name)} <span style="opacity:.6">(${esc(draft.baseUrls[k] || v.baseUrl)})</span>${isCustomProvider(k, draft) ? ' <span class="badge-custom">свой</span>' : ''}</label>
+      <div class="inline"><input type="password" data-key="${esc(k)}" value="${esc(draft.keys[k]||"")}" placeholder="sk-…" autocomplete="off">
+      <button class="btn" data-show="${esc(k)}">👁</button></div></div>`).join("") +
+    `<div class="small">Ключи хранятся только локально в этом браузере (localStorage) и отправляются только выбранному провайдеру.</div>`;
+  $("#keysPane").querySelectorAll("[data-show]").forEach(b=>b.onclick=()=>{
+    const i = $("#keysPane").querySelector(`[data-key="${CSS.escape(b.dataset.show)}"]`);
+    if(i) i.type = i.type==="password"?"text":"password";
+  });
+}
+function hideProviderForm(){
+  editingProvId = null;
+  $("#provForm").classList.remove("show");
+  $("#provFormErr").textContent = "";
+}
+function openProviderForm(editId = null){
+  syncKeysToDraft();
+  editingProvId = editId;
+  const p = editId ? draft.customProviders?.[editId] : null;
+  $("#provFormTitle").textContent = p ? "Редактировать провайдера" : "Новый провайдер";
+  $("#saveProvBtn").textContent = p ? "Обновить провайдера" : "Добавить провайдера";
+  $("#pName").value = p ? p.name : "";
+  $("#pUrl").value = p ? p.baseUrl : "";
+  $("#pKey").value = editId ? (draft.keys[editId] || "") : "";
+  $("#pModels").value = p ? (p.models || []).join(", ") : "";
+  $("#provFormErr").textContent = "";
+  $("#provForm").classList.add("show");
+  $("#pName").focus();
+}
+
 function openSettings(){
   draft = structuredClone(settings);
-  fillProviderSelect($("#sProvider"), draft.provider);
+  hideProviderForm();
+  fillProviderSelect($("#sProvider"), draft.provider, draft);
   syncProviderFields();
-  $("#keysPane").innerHTML = Object.entries(PROVIDERS).map(([k,v])=>`
-    <div class="field"><label>${esc(v.name)} <span style="opacity:.6">(${esc(v.baseUrl)})</span></label>
-      <div class="inline"><input type="password" data-key="${k}" value="${esc(draft.keys[k]||"")}" placeholder="sk-…" autocomplete="off">
-      <button class="btn" data-show="${k}">👁</button></div></div>`).join("") +
-    `<div class="small">Ключи хранятся только локально в этом браузере (localStorage) и отправляются только выбранному провайдеру.</div>`;
-  $("#keysPane").querySelectorAll("[data-show]").forEach(b=>b.onclick=()=>{ const i=$(`[data-key="${b.dataset.show}"]`); i.type = i.type==="password"?"text":"password"; });
+  renderKeysPane();
   $("#sSystem").value = draft.system; $("#sTemp").value = draft.temperature; $("#tempVal").textContent = draft.temperature;
   $("#sMaxTokens").value = draft.maxTokens; $("#sContext").value = draft.context; $("#sStream").checked = draft.stream; $("#sAutoTitle").checked = draft.autoTitle;
   $("#sSyncUrl").value = draft.syncUrl||""; $("#sSyncKey").value = draft.syncKey||""; $("#sSyncCode").value = draft.syncCode||"";
@@ -404,19 +464,101 @@ function openSettings(){
 }
 function syncProviderFields(){
   const p = draft.provider;
-  fillModelSelect($("#sModel"), p, modelsOf(p).includes(draft.model) ? draft.model : modelsOf(p)[0]);
+  const list = modelsOf(p, draft);
+  fillModelSelect($("#sModel"), p, list.includes(draft.model) ? draft.model : (list[0] || ""), draft);
   $("#sCustomModel").value = draft.customModel;
-  $("#sBaseUrl").value = draft.baseUrls[p] || PROVIDERS[p].baseUrl;
+  $("#sBaseUrl").value = baseUrlOf(p, draft);
+  const custom = isCustomProvider(p, draft);
+  $("#editProviderBtn").style.display = custom ? "" : "none";
+  $("#delProviderBtn").style.display = custom ? "" : "none";
 }
-$("#sProvider").onchange = e=>{ draft.baseUrls[draft.provider] = $("#sBaseUrl").value.trim(); draft.provider = e.target.value; draft.customModel=""; syncProviderFields(); };
+function saveCurrentBaseUrlToDraft(){
+  const prev = draft.provider;
+  const bu = $("#sBaseUrl").value.trim().replace(/\/+$/,"");
+  const prevDef = providerOf(prev, draft);
+  if(!prevDef) return;
+  if(isCustomProvider(prev, draft)){
+    if(bu) draft.customProviders[prev].baseUrl = bu;
+    delete draft.baseUrls[prev];
+  } else if(bu && bu !== prevDef.baseUrl.replace(/\/+$/,"")){
+    draft.baseUrls[prev] = bu;
+  } else {
+    delete draft.baseUrls[prev];
+  }
+}
+$("#sProvider").onchange = e=>{
+  saveCurrentBaseUrlToDraft();
+  draft.provider = e.target.value;
+  draft.customModel = "";
+  draft.model = modelsOf(draft.provider, draft)[0] || "";
+  hideProviderForm();
+  syncProviderFields();
+};
+$("#addProviderBtn").onclick = ()=>{
+  if($("#provForm").classList.contains("show") && !editingProvId) hideProviderForm();
+  else openProviderForm(null);
+};
+$("#editProviderBtn").onclick = ()=>{
+  if(isCustomProvider(draft.provider, draft)) openProviderForm(draft.provider);
+};
+$("#cancelProvBtn").onclick = hideProviderForm;
+$("#saveProvBtn").onclick = ()=>{
+  const name = $("#pName").value.trim();
+  const baseUrl = $("#pUrl").value.trim().replace(/\/+$/,"");
+  const key = $("#pKey").value.trim();
+  const models = [...new Set($("#pModels").value.split(/[\n,]+/).map(s=>s.trim()).filter(Boolean))];
+  const err = $("#provFormErr");
+  if(!name){ err.textContent = "Укажите название провайдера"; $("#pName").focus(); return; }
+  if(!/^https?:\/\/.+/i.test(baseUrl)){ err.textContent = "Укажите корректный Base URL (начинается с http:// или https://)"; $("#pUrl").focus(); return; }
+  syncKeysToDraft();
+  const id = editingProvId || ("custom_" + uid());
+  if(!draft.customProviders) draft.customProviders = {};
+  draft.customProviders[id] = { name, baseUrl, models };
+  delete draft.baseUrls[id];
+  draft.keys[id] = key;
+  draft.provider = id;
+  if(!editingProvId){
+    draft.customModel = "";
+    draft.model = models[0] || "";
+  } else if(!modelsOf(id, draft).includes(draft.model)){
+    draft.model = modelsOf(id, draft)[0] || "";
+  }
+  const wasEdit = !!editingProvId;
+  hideProviderForm();
+  fillProviderSelect($("#sProvider"), draft.provider, draft);
+  syncProviderFields();
+  renderKeysPane();
+  $("#fetchStatus").textContent = "";
+  toast(wasEdit ? `Провайдер «${name}» обновлён — нажмите «Сохранить»` : `Провайдер «${name}» добавлен — нажмите «Сохранить»`);
+};
+$("#delProviderBtn").onclick = ()=>{
+  const p = draft.provider;
+  if(!isCustomProvider(p, draft)) return;
+  const name = draft.customProviders[p].name;
+  if(!confirm(`Удалить провайдера «${name}»?`)) return;
+  syncKeysToDraft();
+  delete draft.customProviders[p];
+  delete draft.keys[p];
+  delete draft.baseUrls[p];
+  delete draft.fetchedModels[p];
+  draft.provider = "anymodel";
+  draft.customModel = "";
+  draft.model = modelsOf(draft.provider, draft)[0] || "";
+  hideProviderForm();
+  fillProviderSelect($("#sProvider"), draft.provider, draft);
+  syncProviderFields();
+  renderKeysPane();
+  toast(`Провайдер «${name}» удалён — нажмите «Сохранить»`);
+};
+
 $("#sTemp").oninput = e=> $("#tempVal").textContent = e.target.value;
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active",x===t));
   document.querySelectorAll(".pane").forEach(x=>x.classList.toggle("active",x.dataset.pane===t.dataset.tab)); });
 function collectDraft(){
   draft.model = $("#sModel").value; draft.customModel = $("#sCustomModel").value.trim();
-  const bu = $("#sBaseUrl").value.trim(); if(bu && bu!==PROVIDERS[draft.provider].baseUrl) draft.baseUrls[draft.provider]=bu; else delete draft.baseUrls[draft.provider];
-  document.querySelectorAll("[data-key]").forEach(i=> draft.keys[i.dataset.key] = i.value.trim());
+  saveCurrentBaseUrlToDraft();
+  syncKeysToDraft();
   draft.system = $("#sSystem").value; draft.temperature = +$("#sTemp").value; draft.maxTokens = $("#sMaxTokens").value;
   const oldCode = settings.syncCode;
   draft.syncUrl = $("#sSyncUrl").value.trim(); draft.syncKey = $("#sSyncKey").value.trim(); draft.syncCode = $("#sSyncCode").value.trim();
@@ -425,14 +567,17 @@ function collectDraft(){
 }
 $("#fetchModels").onclick = async ()=>{
   collectDraft(); const p = draft.provider, key = draft.keys[p]; const st = $("#fetchStatus");
+  const url = baseUrlOf(p, draft);
+  if(!url){ st.textContent = "Укажите Base URL провайдера"; return; }
   st.textContent = "Загрузка…";
   try{
-    const r = await fetch((draft.baseUrls[p]||PROVIDERS[p].baseUrl).replace(/\/+$/,"")+"/models", {headers: key?{"Authorization":"Bearer "+key}:{}});
+    const r = await fetch(url+"/models", {headers: key?{"Authorization":"Bearer "+key}:{}});
     if(!r.ok) throw new Error("HTTP "+r.status);
     const j = await r.json(); const ids = (j.data||j.models||[]).map(m=>m.id||m.name).filter(Boolean).sort();
     if(!ids.length) throw new Error("список пуст");
-    draft.fetchedModels[p] = ids; settings.fetchedModels[p] = ids;
-    fillModelSelect($("#sModel"), p, draft.model); st.textContent = `Найдено моделей: ${ids.length}`;
+    draft.fetchedModels[p] = ids;
+    if(providerOf(p, settings)) settings.fetchedModels[p] = ids;
+    fillModelSelect($("#sModel"), p, draft.model, draft); st.textContent = `Найдено моделей: ${ids.length}`;
   }catch(e){ st.textContent = "Не удалось загрузить: "+(e.message==="Failed to fetch"?"сеть/CORS":e.message); }
 };
 $("#saveSettings").onclick = ()=>{ collectDraft(); settings = draft; saveSettingsLS(); refreshTop(); $("#settingsModal").classList.remove("show"); if(!current()?.messages.length) renderMessages(); toast("Сохранено"); Sync.start(); };

@@ -208,7 +208,26 @@ body{font-size:14px}
     </div>
     <div class="modal-body">
       <div class="pane active" data-pane="model">
-        <div class="field"><label>Провайдер</label><select id="sProvider"></select></div>
+        <div class="field"><label>Провайдер</label>
+          <div class="inline">
+            <select id="sProvider"></select>
+            <button class="btn" id="addProviderBtn" title="Добавить своего провайдера">＋</button>
+            <button class="btn" id="editProviderBtn" title="Редактировать провайдера" style="display:none">✏️</button>
+            <button class="btn danger" id="delProviderBtn" title="Удалить провайдера" style="display:none">🗑</button>
+          </div>
+        </div>
+        <div class="prov-form" id="provForm">
+          <div class="prov-form-title"><span id="provFormTitle">Новый провайдер</span></div>
+          <div class="field"><label>Название</label><input id="pName" placeholder="например, OpenAI, Groq, Ollama"></div>
+          <div class="field"><label>Base URL (OpenAI-совместимый)</label><input id="pUrl" placeholder="https://api.openai.com/v1"></div>
+          <div class="field"><label>API-ключ (необязательно для локальных серверов)</label><input id="pKey" type="password" placeholder="sk-…" autocomplete="off"></div>
+          <div class="field"><label>Модели (через запятую или с новой строки, необязательно)</label><textarea id="pModels" rows="2" placeholder="gpt-4o, gpt-4o-mini"></textarea></div>
+          <div class="small" id="provFormErr" style="color:var(--danger);margin-bottom:8px"></div>
+          <div class="inline" style="justify-content:flex-end">
+            <button class="btn" id="cancelProvBtn">Отмена</button>
+            <button class="btn primary" id="saveProvBtn">Добавить провайдера</button>
+          </div>
+        </div>
         <div class="field"><label>Модель из списка</label>
           <div class="inline"><select id="sModel"></select><button class="btn" id="fetchModels">↻ Загрузить с сервера</button></div>
           <div class="small" id="fetchStatus"></div>
