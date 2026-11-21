@@ -232,11 +232,24 @@ async function actOnPage(kind, target, value){
       const selector = t.replace(/^[`'"#№]+|[`'"]+$/g, "");
       const roots = [document];
       for(let i=0;i<roots.length;i++) for(const host of roots[i].querySelectorAll("*")) if(host.shadowRoot) roots.push(host.shadowRoot);
-      const el = /^\d+$/.test(selector) ? roots.map(root=>root.querySelector(`[data-ai-id="${selector}"]`)).find(Boolean) : null;
+      let el = /^\d+$/.test(selector) ? roots.map(root=>root.querySelector(`[data-ai-id="${selector}"]`)).find(Boolean) : null;
+      if(!el){ try{ for(const root of roots){ el = root.querySelector(selector); if(el) break; } }catch{} }
       if(!el) return {ok:false, msg:"элемент не найден"};
-      const r = el.getBoundingClientRect(), o = {bubbles:true, clientX:r.left+r.width/2, clientY:r.top+r.height/2};
-      el.dispatchEvent(new PointerEvent("pointerover",o)); el.dispatchEvent(new MouseEvent("mouseover",o));
-      return {ok:true, msg:`наведено: ${(el.innerText||el.getAttribute("aria-label")||el.tagName).trim().slice(0,50)}`};
+      el.scrollIntoView({block:"center"});
+      const r = el.getBoundingClientRect();
+      const base = {bubbles:true, cancelable:true, view:window, clientX:r.left+r.width/2, clientY:r.top+r.height/2};
+      const ptr = {...base, pointerId:1, pointerType:"mouse", isPrimary:true};
+      el.dispatchEvent(new PointerEvent("pointerover", ptr));
+      el.dispatchEvent(new MouseEvent("mouseover", base));
+      let cur = el;
+      for(let d=0; cur && d<5; d++, cur=cur.parentElement){
+        cur.dispatchEvent(new PointerEvent("pointerenter", {...ptr, bubbles:false}));
+        cur.dispatchEvent(new MouseEvent("mouseenter", {...base, bubbles:false}));
+      }
+      el.dispatchEvent(new PointerEvent("pointermove", ptr));
+      el.dispatchEvent(new MouseEvent("mousemove", base));
+      const hName = (el.innerText||el.getAttribute("aria-label")||el.tagName).replace(/\s+/g," ").trim().slice(0,50);
+      return {ok:true, msg:`наведено: ${hName}`};
     }
     const s = t.replace(/^[`'"#№]+|[`'"]+$/g,"");
     const roots = [document];
@@ -254,7 +267,7 @@ async function actOnPage(kind, target, value){
     }
     if(!el) return {ok:false, msg:"элемент не найден (возможно, страница перерисовалась — обнови снимок через [SCROLL])"};
     el.scrollIntoView({block:"center"});
-    const name = (el.innerText||el.value||el.getAttribute("aria-label")||el.placeholder||el.tagName).trim().slice(0,50);
+    const name = (el.innerText||el.value||el.getAttribute("aria-label")||el.placeholder||el.tagName).replace(/\s+/g," ").trim().slice(0,50);
     if(kind === "select"){
       const want = (v||"").trim().toLowerCase();
       const opts = [...(el.options||[])];
@@ -401,9 +414,19 @@ window.HOOKS = {
     const log = []; let acted = false, failed = false;
 
     // одно сканирование в порядке появления — действия выполняются как написаны
-    const executableText = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`]*`/g, "");
+    const noCodeBlocks = text.replace(/```[\s\S]*?```/g, "");
+    const executableText = noCodeBlocks.replace(/`[^`]*`/g, "");
     const RE = /\[(TYPE|CLICK|ENTER|SELECT|OPEN|SCROLL|WAIT|KEY|HOVER|READ|BACK|SHOT)(?::\s*([^\]\n]*))?\]/gi;
-    const rawActs = [...executableText.matchAll(RE)].map(m=>({kind:m[1].toLowerCase(), arg:(m[2]||"").trim(), raw:m[0]}));
+    let matches = [...executableText.matchAll(RE)];
+    // если модель обернула команду в одинарные бэктики (например `[SCROLL: up]` или `⏳ [SCROLL: up]`), всё равно выполняем
+    if(!matches.length) matches = [...noCodeBlocks.matchAll(RE)];
+    const rawActs = matches.map(m=>({kind:m[1].toLowerCase(), arg:(m[2]||"").trim(), raw:m[0]}));
+    const stripRaw = raw => {
+      const escRaw = raw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const reWrapped = new RegExp("`[^`\\n]{0,6}" + escRaw + "\\s*`");
+      if(reWrapped.test(text)) text = text.replace(reWrapped, "");
+      else text = text.replace(raw, "");
+    };
     const acts = [];
     for(const ra of rawActs){
       if(ra.kind === "click"){
@@ -439,7 +462,7 @@ window.HOOKS = {
         if(apStop) break;
         if(used >= AP_MAX_ACTIONS){
           log.push(`⏸ ещё ${acts.length-used} действий — в следующем шаге`);
-          for(let j = used; j < acts.length; j++) for(const raw of acts[j].raws) text = text.replace(raw, "");
+          for(let j = used; j < acts.length; j++) for(const raw of acts[j].raws) stripRaw(raw);
           break;
         }
         const icon = {type:"⌨️", click:"🖱", enter:"↵", select:"▾", open:"🌐", scroll:"↕️", wait:"⏳", key:"⌨️", hover:"↗️", read:"📖", back:"↩️", shot:"📸"}[a.kind] || "•";
@@ -448,15 +471,16 @@ window.HOOKS = {
           const r = a.kind === "click"
             ? await clickMany(a.target, a.count, a.delayMs)
             : await actOnPage(a.kind, a.target, a.value);
+          const cleanMsg = String(r.msg || "").replace(/\s+/g, " ").trim();
           if(r.ok){
-            log.push(hasTargetId ? `${icon} [${a.target}] ${r.msg}` : `${icon} ${r.msg}`);
+            log.push(hasTargetId ? `${icon} [${a.target}] ${cleanMsg}` : `${icon} ${cleanMsg}`);
             acted = true;
           } else {
-            log.push(`⚠️ ${a.kind} ${a.target}: ${r.msg}`); failed = true;
-            if(apFailed.length < 6 && !apFailed.includes(`${a.kind} ${a.target}`)) apFailed.push(`${a.kind} ${a.target} — ${r.msg}`);
+            log.push(`⚠️ ${a.kind} ${a.target}: ${cleanMsg}`); failed = true;
+            if(apFailed.length < 6 && !apFailed.includes(`${a.kind} ${a.target}`)) apFailed.push(`${a.kind} ${a.target} — ${cleanMsg}`);
           }
-        }catch(e){ log.push(`⚠️ ${a.kind}: ${e.message}`); failed = true; }
-        for(const raw of a.raws) text = text.replace(raw, "");
+        }catch(e){ log.push(`⚠️ ${a.kind}: ${String(e.message||e).replace(/\s+/g," ")}`); failed = true; }
+        for(const raw of a.raws) stripRaw(raw);
         used++;
         if(!apStop && a.kind !== "wait" && a.kind !== "scroll") await sleep(200);
       }
@@ -464,10 +488,12 @@ window.HOOKS = {
       if(controller){ controller = null; updateSendBtn(); }
     }
 
-    const executableRemainder = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`]*`/g, "");
-    const terminalErrorMatch = executableRemainder.match(/\[ERROR:\s*([^\]]+)\]/i);
+    const remainderNoBlocks = text.replace(/```[\s\S]*?```/g, "");
+    const executableRemainder = remainderNoBlocks.replace(/`[^`]*`/g, "");
+    const terminalErrorMatch = executableRemainder.match(/\[ERROR:\s*([^\]]+)\]/i) || remainderNoBlocks.match(/\[ERROR:\s*([^\]]+)\]/i);
     const terminalError = !!terminalErrorMatch;
-    const done = terminalError || (!apStop && /\[DONE\]/.test(executableRemainder) && used >= acts.length && !failed);
+    const hasDone = /\[DONE\]/i.test(executableRemainder) || /\[DONE\]/i.test(remainderNoBlocks);
+    const done = terminalError || (!apStop && hasDone && used >= acts.length && !failed);
 
     if(!log.length && !done){
       if(apStep > 0){
@@ -476,9 +502,9 @@ window.HOOKS = {
       }
       apStep = 0; return;
     }        // обычный ответ без действий
-    text = text.replace(/\[DONE\]|\[ERROR:\s*[^\]]+\]/gi, "").trim();
+    text = text.replace(/`?\s*(\[DONE\]|\[ERROR:\s*[^\]]+\])\s*`?/gi, "").trim();
     if(terminalError) text += `${text ? "\n\n" : ""}Не удалось выполнить: ${terminalErrorMatch[1].trim()}`;
-    if(log.length) text += "\n\n" + log.map(l => "`"+l+"`").join("  \n");
+    if(log.length) text += "\n\n" + log.map(l => "`"+l.replace(/`/g,"'")+"`").join("  \n");
     if(apStop) text += "\n\n⏹ Остановлено";
     else if(done && !terminalError) text += "\n\n✅ Готово!";
     msg.content = text; await persist(c); renderMessages();
@@ -538,7 +564,7 @@ document.getElementById("attachBtn").addEventListener("click", closeMenu);
 paintModes();
 
 // версия расширения из manifest.json
-const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.3";
+const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.4";
 document.querySelectorAll("[data-ver]").forEach(el => { el.textContent = "v" + EXT_VERSION; });
 
 // размышления: OpenRouter использует reasoning, остальные OpenAI-совместимые: reasoning_effort
