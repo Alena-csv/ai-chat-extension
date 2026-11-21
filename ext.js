@@ -245,6 +245,13 @@ async function actOnPage(kind, target, value){
     if(!el){ try{ for(const root of roots){ el = root.querySelector(s); if(el) break; } }catch{} }
     if(!el){ const low = s.toLowerCase(); el = roots.flatMap(root=>[...root.querySelectorAll("a,button,[role=button],input,label,summary,div,span")])
       .find(e => (e.innerText||e.value||e.getAttribute("aria-label")||"").trim().toLowerCase() === low); }
+    if(!el && kind === "click" && v && typeof v === "object" && Number.isFinite(v.cx) && Number.isFinite(v.cy)){
+      const hit = document.elementFromPoint(v.cx, v.cy);
+      if(hit){
+        el = hit.closest?.('button,a,[role="button"],[onclick],[tabindex],label,input') || hit;
+        if(/^\d+$/.test(s) && el) el.setAttribute("data-ai-id", s);
+      }
+    }
     if(!el) return {ok:false, msg:"элемент не найден (возможно, страница перерисовалась — обнови снимок через [SCROLL])"};
     el.scrollIntoView({block:"center"});
     const name = (el.innerText||el.value||el.getAttribute("aria-label")||el.placeholder||el.tagName).trim().slice(0,50);
@@ -300,7 +307,7 @@ async function actOnPage(kind, target, value){
     el.dispatchEvent(new MouseEvent("mouseup", {...base, buttons:0}));
     if(typeof el.click === "function") el.click();
     else el.dispatchEvent(new MouseEvent("click", base));
-    return {ok:true, msg:name};
+    return {ok:true, msg:name, cx, cy};
   }});
   return res?.result || {ok:false, msg:"нет результата"};
 }
@@ -308,16 +315,17 @@ async function actOnPage(kind, target, value){
 async function clickMany(target, count, delayMs){
   if(count <= 1) return actOnPage("click", target, "");
   if(count >= 10) toast(`🖱 Кликаю ×${count} (⏹ — остановить)`);
-  let done = 0, lastName = target;
+  let done = 0, lastName = target, lastPos = null;
   for(let i = 0; i < count; i++){
     if(apStop) break;
-    const r = await actOnPage("click", target, "");
+    const r = await actOnPage("click", target, lastPos || "");
     if(!r.ok){
       if(done === 0) return r;
       return {ok:true, msg:`${lastName} ×${done}/${count} (остановлено: ${r.msg})`};
     }
     done++;
     if(r.msg) lastName = r.msg;
+    if(Number.isFinite(r.cx) && Number.isFinite(r.cy)) lastPos = {cx: r.cx, cy: r.cy};
     if(i + 1 < count && !apStop) await sleep(delayMs);
   }
   if(apStop) return {ok:done > 0, msg:`${lastName} ×${done}/${count} (остановлено)`};
@@ -461,7 +469,13 @@ window.HOOKS = {
     const terminalError = !!terminalErrorMatch;
     const done = terminalError || (!apStop && /\[DONE\]/.test(executableRemainder) && used >= acts.length && !failed);
 
-    if(!log.length && !done){ apStep = 0; return; }        // обычный ответ без действий
+    if(!log.length && !done){
+      if(apStep > 0){
+        msg.content = (msg.content || "").trim() + "\n\n`ℹ️ Автопилот остановлен: модель не указала следующее действие`";
+        await persist(c); renderMessages();
+      }
+      apStep = 0; return;
+    }        // обычный ответ без действий
     text = text.replace(/\[DONE\]|\[ERROR:\s*[^\]]+\]/gi, "").trim();
     if(terminalError) text += `${text ? "\n\n" : ""}Не удалось выполнить: ${terminalErrorMatch[1].trim()}`;
     if(log.length) text += "\n\n" + log.map(l => "`"+l+"`").join("  \n");
@@ -522,6 +536,10 @@ function toggleMode(k){ settings[k] = !settings[k]; saveSettingsLS(); paintModes
 for(const k of Object.keys(MODES)) document.getElementById(MODES[k].btn).onclick = e => { e.stopPropagation(); toggleMode(k); };
 document.getElementById("attachBtn").addEventListener("click", closeMenu);
 paintModes();
+
+// версия расширения из manifest.json
+const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.3";
+document.querySelectorAll("[data-ver]").forEach(el => { el.textContent = "v" + EXT_VERSION; });
 
 // размышления: OpenRouter использует reasoning, остальные OpenAI-совместимые: reasoning_effort
 HOOKS.transformBody = (body, provider) => {

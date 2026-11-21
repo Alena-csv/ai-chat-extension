@@ -150,6 +150,13 @@ body{font-size:14px}
 .mode-chip{display:inline-flex;align-items:center;gap:5px;font-size:12px;background:rgba(77,124,255,.15);border:1px solid rgba(77,124,255,.4);color:var(--accent2);border-radius:20px;padding:3px 6px 3px 9px}
 .mode-chip button{background:none;border:none;color:inherit;padding:0 3px;font-size:15px;line-height:1;opacity:.8}
 .mode-chip button:hover{opacity:1}
+/* форма добавления провайдера */
+.prov-form{border:1px solid var(--border);background:var(--bg);border-radius:10px;padding:12px;margin-bottom:14px;display:none}
+.prov-form.show{display:block}
+.prov-form-title{font-weight:600;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}
+.badge-custom{font-size:11px;background:rgba(77,124,255,.18);border:1px solid rgba(77,124,255,.4);color:var(--accent2);border-radius:6px;padding:1px 6px;margin-left:4px}
+.ver-badge{font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:1px 6px;flex-shrink:0;white-space:nowrap}
+.side-ver{text-align:center;font-size:11px;color:var(--muted);margin-top:6px;opacity:.8}
 </style>
 </head>
 <body>
@@ -160,12 +167,13 @@ body{font-size:14px}
       <input id="search" placeholder="Поиск по чатам…">
     </div>
     <div class="chat-list" id="chatList"></div>
-    <div class="side-bottom"><button class="btn" style="width:100%" id="openSettings2">⚙️ Настройки</button></div>
+    <div class="side-bottom"><button class="btn" style="width:100%" id="openSettings2">⚙️ Настройки</button><div class="side-ver" data-ver>v2.3</div></div>
   </aside>
   <main class="main">
     <div class="topbar">
       <button class="icon-btn" id="toggleSide" title="Меню"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg></button>
       <div class="title" id="chatTitle">Новый чат</div>
+      <span class="ver-badge" data-ver title="Версия расширения">v2.3</span>
       <select id="providerSel" title="Провайдер"></select>
       <select id="modelSel" title="Модель"></select>
       <button class="icon-btn" id="syncBadge" title="Синхронизация">💾</button>
@@ -199,7 +207,7 @@ body{font-size:14px}
 
 <div class="modal-bg" id="settingsModal">
   <div class="modal">
-    <div class="modal-head"><h2>Настройки</h2><button class="icon-btn" id="closeSettings">✕</button></div>
+    <div class="modal-head"><h2>Настройки <span class="ver-badge" data-ver>v2.3</span></h2><button class="icon-btn" id="closeSettings">✕</button></div>
     <div class="tabs">
       <button class="tab active" data-tab="model">Модель</button>
       <button class="tab" data-tab="keys">API-ключи</button>

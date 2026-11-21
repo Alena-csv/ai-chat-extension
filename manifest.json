@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "AI Chat — помощник для страниц",
-  "version": "2.2",
+  "version": "2.3",
   "description": "AI-чат в боковой панели: видит открытую страницу, кликает и вводит текст, синхронизирует чаты через Supabase.",
   "permissions": [
     "sidePanel",
