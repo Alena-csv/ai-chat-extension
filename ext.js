@@ -1,7 +1,8 @@
 // ============ РАСШИРЕНИЕ: видит страницу + автопилот ============
 const AP_MAX_STEPS = 50;          // шагов автопилота до остановки
-const AP_MAX_ACTIONS = 5;         // действий за один ответ модели
+const AP_MAX_ACTIONS = 10;        // действий за один ответ модели
 const AP_MAX_ITEMS = 400;         // сколько элементов показывать модели
+const AP_MAX_CLICKS = 1000;       // максимум кликов в одной команде [CLICK: id | N]
 let apStep = 0, apStop = false;
 let apConsecutiveFailures = 0;
 let apPrev = null;                // прошлый снимок (для диффа)
@@ -16,31 +17,32 @@ const AP_PROMPT = `Ты AI-ассистент в боковой панели б�
 АВТОПИЛОТ: если пользователь просит что-то СДЕЛАТЬ на странице (задач может быть НЕСКОЛЬКО) — выполняй их по порядку, шаг за шагом.
 Для действий используй только отдельные команды формата [TYPE: ...], [CLICK: ...] и т.п. Не помещай команды в примеры, цитаты или блоки кода. Если команда не сработала, выбери другой способ.
 
-Элементы страницы пронумерованы. Формат строки:
+Элементы страницы пронумерованы с префиксом фрейма (например, 0:12). Формат строки:
 НОМЕР | тип | подпись | значение | координаты | состояние
-Например: 12 | input:text | Email | пусто | 640,240 | обязательное
-Номера НЕ МЕНЯЮТСЯ между шагами — ссылайся на них спокойно.
+Например: 0:12 | input:text | Email | пусто | 640,240 | обязательное
+Номера НЕ МЕНЯЮТСЯ между шагами — указывай номер точно как в списке (вместе с префиксом, например 0:12).
 
 Действия — до ${AP_MAX_ACTIONS} за ответ, выполняются строго в том порядке, в каком написаны:
-[TYPE: 5 | текст] — ввести текст в поле №5
-[CLICK: 12] — клик по элементу №12
-[ENTER: 5] — Enter в поле №5
-[SELECT: 7 | Москва] — выбрать вариант в выпадающем списке №7
+[TYPE: 0:5 | текст] — ввести текст в поле №0:5
+[CLICK: 0:12] — клик по элементу №0:12
+[CLICK: 0:12 | 50] или [CLICK: 0:12 | 50 | 100] — кликнуть по элементу №0:12 много раз подряд (50 раз, пауза 100 мс; по умолчанию 150 мс, до ${AP_MAX_CLICKS} кликов)
+[ENTER: 0:5] — Enter в поле №0:5
+[SELECT: 0:7 | Москва] — выбрать вариант в выпадающем списке №0:7
 [OPEN: https://...] — открыть адрес в текущей вкладке
 [SCROLL: down] или [SCROLL: up] — прокрутить страницу
 [WAIT: 2] — подождать 2 секунды, если сайт явно грузит
 [KEY: Tab] или [KEY: Ctrl+A] — отправить клавишу активному элементу
 [BACK] — вернуться на предыдущую страницу
-[HOVER: 12] — навести указатель на элемент №12
+[HOVER: 0:12] — навести указатель на элемент №0:12
 [READ] — прочитать дополнительный текст страницы
 [SHOT] — сделать скриншот для следующего шага (требуется модель с vision)
 
 Правила:
-1. Сначала действия, потом короткий текст. Пример: «Заполняю форму» [TYPE: 3 | Иван] [TYPE: 4 | ivan@mail.ru] [CLICK: 9]
-2. Поле уже заполнено нужным — не переписывай.
-3. Элемента нет в списке → [SCROLL: down], затем смотри блок [ЧТО ИЗМЕНИЛОСЬ] — там новые номера.
-4. Не повторяй действие, которое уже отмечено как неудачное.
-5. Проверяй результат по блоку [ЧТО ИЗМЕНИЛОСЬ С ПРОШЛОГО ШАГА]; если ничего не изменилось — меняй тактику, а не повторяй клик.
+1. Сначала действия, потом короткий текст. Пример: «Заполняю форму» [TYPE: 0:3 | Иван] [TYPE: 0:4 | ivan@mail.ru] [CLICK: 0:9]
+2. Если пользователь просит покликать по элементу много раз (как кликер) — используй [CLICK: id | количество | пауза_мс], а не повторяй одиночный [CLICK].
+3. Поле уже заполнено нужным — не переписывай.
+4. Элемента нет в списке → [SCROLL: down], затем смотри обновлённый список элементов.
+5. Не повторяй действие, которое завершилось ошибкой (блок [УЖЕ НЕ СРАБОТАЛО]). Если действие должно было открыть/переключить элемент, но ничего не изменилось — попробуй другой элемент или способ.
 6. [DONE] — только когда ВСЕ задачи выполнены, с кратким итогом.
 7. Совсем невозможно → [ERROR: причина].
 8. Снимок [SHOT] появится в следующем сообщении пользователя; используй его вместе со списком элементов.
@@ -141,8 +143,11 @@ async function pageSnapshot(){
       id:`${f.frameId}:${i.id}`, frameId:f.frameId, localId:i.id,
       line:i.line.replace(/^\d+\s*\|/, `${f.frameId}:${i.id} |`), sig:i.sig
     }))).slice(0, AP_MAX_ITEMS);
+    const fullText = frames.map(f=>f.result.frameText || f.result.text).filter(Boolean).join("\n\n");
+    let textHash = 0;
+    for(let i = 0; i < fullText.length; i++) textHash = (textHash * 31 + fullText.charCodeAt(i)) | 0;
     return {...main, items, total:frames.reduce((n,f)=>n+f.result.total,0),
-      text:frames.map(f=>f.result.frameText || f.result.text).filter(Boolean).join("\n\n"),
+      text:fullText, textHash,
       textLen:frames.reduce((n,f)=>n+f.result.textLen,0)};
   }catch(e){ return {blocked:true, error:e.message}; }
 }
@@ -153,8 +158,8 @@ async function pageSig(){
     const tab = await getTargetTab();
     if(!tab) return null;
     const [r] = await chrome.scripting.executeScript({target:{tabId:tab.id}, func:()=>{
-      const t = document.body ? document.body.innerText : "";
-      let h = 0; for(let i=0;i<t.length;i+=7) h = (h*31 + t.charCodeAt(i))|0;
+      const t = (document.body ? document.body.innerText : "").slice(0, 30000);
+      let h = 0; for(let i=0;i<t.length;i++) h = (h*31 + t.charCodeAt(i))|0;
       return {h, n:t.length, d:document.querySelectorAll("[data-ai-id]").length,
               ready:document.readyState==="complete", busy:!!document.querySelector('[aria-busy="true"]')};
     }});
@@ -165,22 +170,27 @@ async function pageSig(){
 // ждём, пока страница изменится и успокоится (SPA, модалки, ajax) — вместо фиксированных пауз
 async function waitStable(base){
   const t0 = Date.now();
-  await sleep(300);
-  let last = null, quiet = 0;
-  while(Date.now() - t0 < 8000){
+  await sleep(250);
+  let last = null, quiet = 0, noMove = 0;
+  while(Date.now() - t0 < 6000){
+    if(apStop) return false;
     const s = await pageSig();
-    if(!s){ await sleep(300); continue; }
+    if(!s){ await sleep(250); continue; }
     const moved = !base || s.h!==base.h || s.n!==base.n || s.d!==base.d;
     if(moved){
+      noMove = 0;
       if(last && last.h===s.h && last.n===s.n && last.d===s.d) quiet++; else quiet = 0;
       last = s;
-      if(quiet >= 2 && !s.busy){ await sleep(250); return true; }
-    } else if(last && last.h===s.h) { quiet++; if(quiet >= 6) return false; }
-    await sleep(280);
+      if(quiet >= 2 && !s.busy){ await sleep(200); return true; }
+    } else {
+      noMove++;
+      if(noMove >= 4 && s.ready && !s.busy) return false;
+    }
+    await sleep(250);
   }
   // не дождались изменений — хотя бы убеждаемся, что вкладка догрузилась
   try{ const tab = await getTargetTab();
-    for(let i=0;i<20;i++){ const t = await chrome.tabs.get(tab.id); if(t.status==="complete") break; await sleep(200); } }catch{}
+    for(let i=0;i<20 && !apStop;i++){ const t = await chrome.tabs.get(tab.id); if(t.status==="complete") break; await sleep(200); } }catch{}
   return false;
 }
 
@@ -202,7 +212,7 @@ async function actOnPage(kind, target, value){
     apReadText = readResult?.result || "";
     return {ok:true, msg:`прочитан текст (${apReadText.length} символов)`};
   }
-  const targetText = String(target||"").trim();
+  const targetText = String(target||"").trim().replace(/^[`'"#№]+|[`'"]+$/g, "");
   const framed = targetText.match(/^(\d+):(\d+)$/);
   const frameId = framed ? Number(framed[1]) : 0;
   const localTarget = framed ? framed[2] : targetText;
@@ -273,8 +283,14 @@ async function actOnPage(kind, target, value){
     const base = {bubbles:true, cancelable:true, view:window, clientX:cx, clientY:cy, button:0};
     const ptrDown = {...base, pointerId:1, pointerType:"mouse", isPrimary:true, buttons:1};
     const ptrUp   = {...base, pointerId:1, pointerType:"mouse", isPrimary:true, buttons:0};
-    const old = el.style?.outline;
-    if(el.style){ el.style.outline = "3px solid #ff5d73"; setTimeout(()=>el.style.outline = old, 1200); }
+    if(el.style){
+      const OM = window.__aiOutlines || (window.__aiOutlines = new WeakMap());
+      let st = OM.get(el);
+      if(!st){ st = {old: el.style.outline, timer: 0}; OM.set(el, st); }
+      clearTimeout(st.timer);
+      el.style.outline = "3px solid #ff5d73";
+      st.timer = setTimeout(()=>{ el.style.outline = st.old; OM.delete(el); }, 900);
+    }
     el.dispatchEvent(new PointerEvent("pointerover", ptrUp));
     el.dispatchEvent(new MouseEvent("mouseover", base));
     el.dispatchEvent(new PointerEvent("pointerdown", ptrDown));
@@ -289,33 +305,52 @@ async function actOnPage(kind, target, value){
   return res?.result || {ok:false, msg:"нет результата"};
 }
 
-// --- текст [СТРАНИЦА] для модели: первый шаг полный, дальше только изменения ---
+async function clickMany(target, count, delayMs){
+  if(count <= 1) return actOnPage("click", target, "");
+  if(count >= 10) toast(`🖱 Кликаю ×${count} (⏹ — остановить)`);
+  let done = 0, lastName = target;
+  for(let i = 0; i < count; i++){
+    if(apStop) break;
+    const r = await actOnPage("click", target, "");
+    if(!r.ok){
+      if(done === 0) return r;
+      return {ok:true, msg:`${lastName} ×${done}/${count} (остановлено: ${r.msg})`};
+    }
+    done++;
+    if(r.msg) lastName = r.msg;
+    if(i + 1 < count && !apStop) await sleep(delayMs);
+  }
+  if(apStop) return {ok:done > 0, msg:`${lastName} ×${done}/${count} (остановлено)`};
+  return {ok:true, msg:`${lastName} ×${done}`};
+}
+
+// --- текст [СТРАНИЦА] для модели: всегда актуальный список элементов + дифф изменений ---
 function buildCtx(snap, mode, msgs){
   if(!snap) return "\n\n[СТРАНИЦА]\n(не удалось прочитать страницу)";
   if(snap.blocked) return `\n\n[СТРАНИЦА]\n${snap.title||""}\n${snap.url||""}\n(браузер не разрешает расширениям читать эту страницу${snap.error?": "+snap.error:""})`;
   const head = `\n\n[СТРАНИЦА]\n${snap.title}\n${snap.url}`;
   const fail = apFailed.length ? `\n\n[УЖЕ НЕ СРАБОТАЛО — НЕ ПОВТОРЯЙ]\n${apFailed.join("\n")}` : "";
+  const items = snap.items.map(i=>i.line).join("\n");
+  const itemsBlock = `\n\nЭлементы (${snap.items.length} из ${snap.total}, порядок сверху вниз, вне экрана помечено):\n` + (items || "(нет)");
   if(mode !== "diff" || !apPrev || apPrev.url !== snap.url){
-    const items = snap.items.map(i=>i.line).join("\n");
-    return `${head}${fail}\n\nЭлементы (${snap.items.length} из ${snap.total}, порядок сверху вниз, вне экрана помечено):\n`
-      + (items || "(нет)") + `\n\nТекст страницы (начало):\n${snap.text.slice(0,8000)}`;
+    return `${head}${fail}${itemsBlock}\n\nТекст страницы (начало):\n${snap.text.slice(0,8000)}`;
   }
   const prev = new Map(apPrev.items.map(i=>[i.id, i.sig]));
   const cur = new Map(snap.items.map(i=>[i.id, i.sig]));
   const added = snap.items.filter(i=>!prev.has(i.id)).map(i=>i.line);
   const changed = snap.items.filter(i=>prev.has(i.id) && prev.get(i.id)!==i.sig).map(i=>i.line);
   const gone = [...prev.keys()].filter(id=>!cur.has(id)).map(id=>"№"+id);
-  const textChanged = snap.textLen !== apPrev.textLen;
+  const textChanged = snap.textHash !== apPrev.textHash || snap.textLen !== apPrev.textLen;
   let s = `${head}${fail}\n\n[ЧТО ИЗМЕНИЛОСЬ С ПРОШЛОГО ШАГА]`;
   if(!added.length && !changed.length && !gone.length && !textChanged){
-    s += "\nНичего не изменилось — действие, похоже, не сработало. Смени тактику.";
+    s += "\nDOM и текст не изменились (если действие должно было изменить страницу — проверь другой элемент или способ).";
   } else {
     if(added.length) s += "\nПоявились:\n" + added.join("\n");
     if(changed.length) s += "\nИзменились:\n" + changed.join("\n");
     if(gone.length) s += "\nИсчезли: " + gone.join(", ");
-    if(textChanged) s += "\n\nТекст сейчас (начало):\n" + snap.text.slice(0,1200);
+    if(textChanged) s += "\n\nТекст сейчас (начало):\n" + snap.text.slice(0,2000);
   }
-  s += `\n\nВсего элементов: ${snap.total} (показано ${snap.items.length}). Номера прежние.`;
+  s += itemsBlock;
   return s;
 }
 
@@ -360,45 +395,80 @@ window.HOOKS = {
     // одно сканирование в порядке появления — действия выполняются как написаны
     const executableText = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`]*`/g, "");
     const RE = /\[(TYPE|CLICK|ENTER|SELECT|OPEN|SCROLL|WAIT|KEY|HOVER|READ|BACK|SHOT)(?::\s*([^\]\n]*))?\]/gi;
-    const acts = [...executableText.matchAll(RE)].map(m=>({kind:m[1].toLowerCase(), arg:(m[2]||"").trim(), raw:m[0]}));
+    const rawActs = [...executableText.matchAll(RE)].map(m=>({kind:m[1].toLowerCase(), arg:(m[2]||"").trim(), raw:m[0]}));
+    const acts = [];
+    for(const ra of rawActs){
+      if(ra.kind === "click"){
+        const p = (ra.arg||"").split("|").map(s=>s.trim());
+        const target = p[0] || "";
+        const count = Math.min(AP_MAX_CLICKS, Math.max(1, parseInt(p[1], 10) || 1));
+        const delayMs = p[2] !== undefined && p[2] !== "" ? Math.min(5000, Math.max(10, parseInt(p[2], 10) || 150)) : 150;
+        const prev = acts[acts.length - 1];
+        if(prev && prev.kind === "click" && prev.target === target){
+          prev.count = Math.min(AP_MAX_CLICKS, prev.count + count);
+          prev.delayMs = Math.min(prev.delayMs, delayMs);
+          prev.raws.push(ra.raw);
+          continue;
+        }
+        acts.push({kind:"click", target, count, delayMs, value:"", raws:[ra.raw]});
+      } else if(ra.kind === "type" || ra.kind === "select"){
+        const p = (ra.arg||"").split("|");
+        acts.push({kind:ra.kind, target:(p[0]||"").trim(), value:p.slice(1).join("|").trim(), raws:[ra.raw]});
+      } else {
+        acts.push({kind:ra.kind, target:ra.arg, value:"", raws:[ra.raw]});
+      }
+    }
     if(acts.some(a=>a.kind==="open" || a.kind==="back")) apPrev = null;
     const before = acts.length ? await pageSig() : null;
 
     let used = 0;
-    for(const a of acts){
-      if(used >= AP_MAX_ACTIONS){ log.push(`⏸ ещё ${acts.length-used} действий — в следующем шаге`); break; }
-      let target = a.arg, value = "";
-      if(a.kind === "type" || a.kind === "select"){
-        const p = (a.arg||"").split("|");
-        target = (p[0]||"").trim();
-        value = p.slice(1).join("|").trim();
-      }
-      const icon = {type:"⌨️", click:"🖱", enter:"↵", select:"▾", open:"🌐", scroll:"↕️", wait:"⏳", key:"⌨️", hover:"↗️", read:"📖", back:"↩️", shot:"📸"}[a.kind] || "•";
-      try{
-        const r = await actOnPage(a.kind, target, value);
-        if(r.ok){ log.push(`${icon} ${r.msg}`); acted = true; }
-        else {
-          log.push(`⚠️ ${a.kind} ${target}: ${r.msg}`); failed = true;
-          if(apFailed.length < 6 && !apFailed.includes(`${a.kind} ${target}`)) apFailed.push(`${a.kind} ${target} — ${r.msg}`);
+    apStop = false;
+    if(acts.length){
+      controller = new AbortController(); controller.signal.onabort = () => apStop = true; updateSendBtn();
+    }
+    try{
+      for(const a of acts){
+        if(apStop) break;
+        if(used >= AP_MAX_ACTIONS){
+          log.push(`⏸ ещё ${acts.length-used} действий — в следующем шаге`);
+          for(let j = used; j < acts.length; j++) for(const raw of acts[j].raws) text = text.replace(raw, "");
+          break;
         }
-      }catch(e){ log.push(`⚠️ ${a.kind}: ${e.message}`); failed = true; }
-      text = text.replace(a.raw, "");
-      used++;
-      if(a.kind !== "wait" && a.kind !== "scroll") await sleep(200);
+        const icon = {type:"⌨️", click:"🖱", enter:"↵", select:"▾", open:"🌐", scroll:"↕️", wait:"⏳", key:"⌨️", hover:"↗️", read:"📖", back:"↩️", shot:"📸"}[a.kind] || "•";
+        const hasTargetId = /^(click|type|enter|select|hover)$/.test(a.kind) && a.target;
+        try{
+          const r = a.kind === "click"
+            ? await clickMany(a.target, a.count, a.delayMs)
+            : await actOnPage(a.kind, a.target, a.value);
+          if(r.ok){
+            log.push(hasTargetId ? `${icon} [${a.target}] ${r.msg}` : `${icon} ${r.msg}`);
+            acted = true;
+          } else {
+            log.push(`⚠️ ${a.kind} ${a.target}: ${r.msg}`); failed = true;
+            if(apFailed.length < 6 && !apFailed.includes(`${a.kind} ${a.target}`)) apFailed.push(`${a.kind} ${a.target} — ${r.msg}`);
+          }
+        }catch(e){ log.push(`⚠️ ${a.kind}: ${e.message}`); failed = true; }
+        for(const raw of a.raws) text = text.replace(raw, "");
+        used++;
+        if(!apStop && a.kind !== "wait" && a.kind !== "scroll") await sleep(200);
+      }
+    } finally {
+      if(controller){ controller = null; updateSendBtn(); }
     }
 
     const executableRemainder = text.replace(/```[\s\S]*?```/g, "").replace(/`[^`]*`/g, "");
     const terminalErrorMatch = executableRemainder.match(/\[ERROR:\s*([^\]]+)\]/i);
     const terminalError = !!terminalErrorMatch;
-    const done = terminalError || (/\[DONE\]/.test(executableRemainder) && used >= acts.length && !failed);
+    const done = terminalError || (!apStop && /\[DONE\]/.test(executableRemainder) && used >= acts.length && !failed);
 
     if(!log.length && !done){ apStep = 0; return; }        // обычный ответ без действий
     text = text.replace(/\[DONE\]|\[ERROR:\s*[^\]]+\]/gi, "").trim();
     if(terminalError) text += `${text ? "\n\n" : ""}Не удалось выполнить: ${terminalErrorMatch[1].trim()}`;
     if(log.length) text += "\n\n" + log.map(l => "`"+l+"`").join("  \n");
-    if(done && !terminalError) text += "\n\n✅ Готово!";
+    if(apStop) text += "\n\n⏹ Остановлено";
+    else if(done && !terminalError) text += "\n\n✅ Готово!";
     msg.content = text; await persist(c); renderMessages();
-    if(done){ apStep = 0; apConsecutiveFailures = 0; apFailed = []; return; }
+    if(done || apStop || current() !== c){ apStep = 0; apConsecutiveFailures = 0; apFailed = []; return; }
     if(failed && !acted) apConsecutiveFailures++; else if(acted) apConsecutiveFailures = 0;
     if(apConsecutiveFailures >= 3){
       msg.content += "\n\nАвтопилот остановлен после трёх неудачных попыток. Проверьте страницу и попробуйте другой запрос.";
@@ -415,7 +485,7 @@ window.HOOKS = {
     controller = null; updateSendBtn();
     if(apStop || current() !== c){ apStep = 0; return; }
     c.messages.push({role:"user", auto:true, time:Date.now(), content:
-      `(автопилот: шаг ${apStep} выполнен) Проверь по блоку «что изменилось», что вышло, и продолжай со следующей невыполненной задачи. Когда ВСЕ задачи выполнены — итог + [DONE].`});
+      `(автопилот: шаг ${apStep} выполнен) Проверь по блоку «что изменилось» и актуальному списку элементов, что вышло, и продолжай со следующей невыполненной задачи. Когда ВСЕ задачи выполнены — итог + [DONE].`});
     await persist(c);
     generate();
   }
