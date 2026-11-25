@@ -27,7 +27,7 @@ const DEFAULTS = {
   provider:"anymodel", model:"cx/gpt-5.6-luna", customModel:"",
   keys:{anymodel:"",darkapi:"",openrouter:"",nyxos:"",xkiro:"",tooken:"",ghostly:""},
   baseUrls:{}, fetchedModels:{}, customProviders:{},
-  system:"", temperature:0.7, maxTokens:"", context:0, stream:true, autoTitle:true,
+  system:"", temperature:0.7, maxTokens:"", context:0, apContext:20, stream:true, autoTitle:true,
   syncUrl:"", syncKey:"", syncCode:""
 };
 
@@ -132,13 +132,18 @@ function splitThink(text){
 // ============ ЧАТЫ ============
 const current = () => chats.find(c=>c.id===currentId);
 function newChat(){
+  if(window.HOOKS?.onReset) HOOKS.onReset("newChat");
   const c = {id:uid(), title:"Новый чат", created:Date.now(), updated:Date.now(), messages:[]};
   chats.unshift(c); currentId = c.id; localStorage.setItem("aichat_current", c.id);
   renderList(); renderMessages(); $("#input").focus();
 }
-function selectChat(id){ currentId=id; localStorage.setItem("aichat_current", id); renderList(); renderMessages();
-  if(innerWidth<760) $("#sidebar").classList.add("hidden"); }
-async function persist(c){ c.updated = Date.now(); await dbPut(c); Sync.schedule(); }
+function selectChat(id){
+  if(window.HOOKS?.onReset) HOOKS.onReset("selectChat");
+  currentId=id; localStorage.setItem("aichat_current", id); renderList(); renderMessages();
+  if(innerWidth<760) $("#sidebar").classList.add("hidden");
+}
+const cleanChatForStorage = c => ({...c, messages:(c.messages||[]).filter(m=>!m.auto)});
+async function persist(c){ c.updated = Date.now(); await dbPut(cleanChatForStorage(c)); Sync.schedule(); }
 
 function renderList(){
   const q = $("#search").value.toLowerCase();
@@ -209,7 +214,7 @@ $("#messages").addEventListener("click", e=>{
   if(controller) return toast("Дождитесь окончания ответа");
   if(a==="copy"){ navigator.clipboard.writeText(m.content||""); toast("Скопировано"); }
   if(a==="del"){ c.messages.splice(idx,1); persist(c); renderMessages(); }
-  if(a==="regen"){ c.messages.splice(idx); persist(c); renderMessages(); generate(); }
+  if(a==="regen"){ if(window.HOOKS?.onReset) HOOKS.onReset("regen"); c.messages.splice(idx); persist(c); renderMessages(); generate(); }
   if(a==="edit"){ $("#input").value = m.content||""; pending = [...(m.attachments||[])]; renderPending(); autoGrow();
     c.messages.splice(idx); persist(c); renderMessages(); $("#input").focus(); }
 });
@@ -279,6 +284,7 @@ async function send(){
   const text = input.value.trim();
   if(controller || (!text && !pending.length)) return;
   if(!current()) newChat();
+  if(window.HOOKS?.onReset) HOOKS.onReset("send");
   const c = current();
   c.messages.push({role:"user", content:text, attachments:pending, time:Date.now()});
   if(settings.autoTitle && c.title==="Новый чат"){
@@ -289,24 +295,89 @@ async function send(){
   generate();
 }
 
-function buildApiMessages(c){
-  let msgs = c.messages.filter(m => !m.error || m.content);
-  if(settings.context > 0) msgs = msgs.slice(-settings.context);
-  const out = [];
-  if(settings.system.trim()) out.push({role:"system", content:settings.system.trim()});
-  for(const m of msgs){
-    if(m.role==="assistant"){ out.push({role:"assistant", content: splitThink(m.content||"").rest}); continue; }
-    const atts = m.attachments||[];
-    let text = m.content||"";
-    atts.filter(a=>a.type==="file").forEach(a=>{ text += `\n\n--- Файл: ${a.name} ---\n\`\`\`\n${a.text}\n\`\`\``; });
-    const imgs = atts.filter(a=>a.type==="image"), pdfs = atts.filter(a=>a.type==="pdf");
-    if(!imgs.length && !pdfs.length){ out.push({role:"user", content:text}); continue; }
-    const parts = [];
-    if(text) parts.push({type:"text", text});
-    imgs.forEach(a=>parts.push({type:"image_url", image_url:{url:a.dataUrl}}));
-    pdfs.forEach(a=>parts.push({type:"file", file:{filename:a.name, file_data:a.dataUrl}}));
-    out.push({role:"user", content:parts});
+function cleanAssistantText(m, cleanAutopilot = false){
+  let t = splitThink(m.content || "").rest;
+  if(!cleanAutopilot) return t;
+  if(typeof m.apSummary === "string") return m.apSummary;
+  // Убираем UI-логи действий автопилота и статусы из прошлых ответов,
+  // чтобы модель не имитировала их вместо команд [CLICK: ...] / [TYPE: ...]
+  t = t
+    .replace(/^\s*`(?:⌨️|🖱|↵|▾|🌐|↕️|⏳|↗️|📖|↩️|📸|•|⚠️|⏸|ℹ️)[^`\n]*`\s*$/gm, "")
+    .replace(/^\s*(?:✅ Готово!|⏹ Остановлено|\*— остановлено —\*)\s*$/gm, "")
+    .replace(/^\s*Автопилот остановлен после трёх неудачных попыток\.[^\n]*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return t || "Выполнил действия на странице.";
+}
+
+function userMsgToApi(m, {includeMedia = true} = {}){
+  const atts = m.attachments || [];
+  let text = m.content || "";
+  atts.filter(a=>a.type==="file").forEach(a=>{ text += `\n\n--- Файл: ${a.name} ---\n\`\`\`\n${a.text}\n\`\`\``; });
+  const imgs = atts.filter(a=>a.type==="image"), pdfs = atts.filter(a=>a.type==="pdf");
+  if(!includeMedia){
+    if(imgs.length) text += (text ? "\n" : "") + `[ранее прикреплено изображений: ${imgs.length}]`;
+    if(pdfs.length) text += (text ? "\n" : "") + `[ранее прикреплено PDF: ${pdfs.length}]`;
+    return {role:"user", content:text};
   }
+  if(!imgs.length && !pdfs.length) return {role:"user", content:text};
+  const parts = [];
+  if(text) parts.push({type:"text", text});
+  imgs.forEach(a=>parts.push({type:"image_url", image_url:{url:a.dataUrl}}));
+  pdfs.forEach(a=>parts.push({type:"file", file:{filename:a.name, file_data:a.dataUrl}}));
+  return {role:"user", content:parts};
+}
+
+function mergeApiContent(a, b){
+  if(typeof a === "string" && typeof b === "string"){
+    if(!a) return b;
+    if(!b) return a;
+    return a + "\n\n" + b;
+  }
+  const toParts = c => Array.isArray(c) ? c.map(p=>({...p})) : (c ? [{type:"text", text:String(c)}] : []);
+  return [...toParts(a), ...toParts(b)];
+}
+
+function normalizeApiMessages(list){
+  const out = [];
+  for(const m of list){
+    if(!m) continue;
+    const prev = out[out.length - 1];
+    if(prev && prev.role === m.role && m.role !== "system"){
+      prev.content = mergeApiContent(prev.content, m.content);
+    } else {
+      out.push({role:m.role, content:Array.isArray(m.content) ? m.content.map(p=>({...p})) : m.content});
+    }
+  }
+  return out;
+}
+
+function buildApiMessages(c, opts = {}){
+  const {
+    limit = settings.context,
+    includeSystem = true,
+    includeMedia = true,
+    mediaOnlyLastUser = false,
+    cleanAutopilot = false
+  } = opts;
+  let msgs = (c.messages || []).filter(m => !m.auto && (!m.error || m.content));
+  if(limit > 0){
+    msgs = msgs.slice(-limit);
+    while(msgs.length > 1 && msgs[0].role === "assistant") msgs = msgs.slice(1);
+  }
+  let lastUserIdx = -1;
+  if(mediaOnlyLastUser){
+    for(let i = msgs.length - 1; i >= 0; i--){ if(msgs[i].role === "user"){ lastUserIdx = i; break; } }
+  }
+  const mapped = [];
+  for(let i = 0; i < msgs.length; i++){
+    const m = msgs[i];
+    if(m.role === "assistant"){ mapped.push({role:"assistant", content: cleanAssistantText(m, cleanAutopilot)}); continue; }
+    const useMedia = includeMedia && (!mediaOnlyLastUser || i === lastUserIdx);
+    mapped.push(userMsgToApi(m, {includeMedia: useMedia}));
+  }
+  const out = normalizeApiMessages(mapped);
+  if(includeSystem && settings.system.trim()) out.unshift({role:"system", content:settings.system.trim()});
   return out;
 }
 
@@ -457,7 +528,9 @@ function openSettings(){
   syncProviderFields();
   renderKeysPane();
   $("#sSystem").value = draft.system; $("#sTemp").value = draft.temperature; $("#tempVal").textContent = draft.temperature;
-  $("#sMaxTokens").value = draft.maxTokens; $("#sContext").value = draft.context; $("#sStream").checked = draft.stream; $("#sAutoTitle").checked = draft.autoTitle;
+  $("#sMaxTokens").value = draft.maxTokens; $("#sContext").value = draft.context;
+  const apCtxEl = $("#sApContext"); if(apCtxEl) apCtxEl.value = draft.apContext ?? DEFAULTS.apContext;
+  $("#sStream").checked = draft.stream; $("#sAutoTitle").checked = draft.autoTitle;
   $("#sSyncUrl").value = draft.syncUrl||""; $("#sSyncKey").value = draft.syncKey||""; $("#sSyncCode").value = draft.syncCode||"";
   $("#fetchStatus").textContent = "";
   $("#settingsModal").classList.add("show");
@@ -563,7 +636,13 @@ function collectDraft(){
   const oldCode = settings.syncCode;
   draft.syncUrl = $("#sSyncUrl").value.trim(); draft.syncKey = $("#sSyncKey").value.trim(); draft.syncCode = $("#sSyncCode").value.trim();
   if(draft.syncCode !== oldCode) Sync.reset();
-  draft.context = +$("#sContext").value || 0; draft.stream = $("#sStream").checked; draft.autoTitle = $("#sAutoTitle").checked;
+  draft.context = Math.max(0, parseInt($("#sContext").value, 10) || 0);
+  const apCtxEl = $("#sApContext");
+  if(apCtxEl){
+    const rawApCtx = apCtxEl.value.trim();
+    draft.apContext = rawApCtx === "" ? DEFAULTS.apContext : Math.max(0, parseInt(rawApCtx, 10) || 0);
+  }
+  draft.stream = $("#sStream").checked; draft.autoTitle = $("#sAutoTitle").checked;
 }
 $("#fetchModels").onclick = async ()=>{
   collectDraft(); const p = draft.provider, key = draft.keys[p]; const st = $("#fetchStatus");
@@ -632,7 +711,7 @@ const Sync = (()=>{
       const m = meta();
       // 1) отправляем изменённые и удалённые чаты
       const rows = chats.filter(c => c.messages.length && (m.pushed[c.id]||0) < c.updated)
-        .map(c => ({id:c.id, updated:c.updated, deleted:false, data:c}));
+        .map(c => ({id:c.id, updated:c.updated, deleted:false, data:cleanChatForStorage(c)}));
       for(const id of m.deleted) rows.push({id, updated:Date.now(), deleted:true});
       for(let i=0; i<rows.length; i+=20){ // пачками, чтобы не упереться в размер запроса
         const part = rows.slice(i, i+20);

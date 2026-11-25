@@ -3,14 +3,27 @@ const AP_MAX_STEPS = 50;          // шагов автопилота до ост
 const AP_MAX_ACTIONS = 10;        // действий за один ответ модели
 const AP_MAX_ITEMS = 400;         // сколько элементов показывать модели
 const AP_MAX_CLICKS = 1000;       // максимум кликов в одной команде [CLICK: id | N]
+const AP_MAX_TRACE = 6;           // сколько последних шагов текущего цикла держать в контексте
 let apStep = 0, apStop = false;
 let apConsecutiveFailures = 0;
 let apPrev = null;                // прошлый снимок (для диффа)
 let apFailed = [];                // что уже не сработало — модели нельзя повторять
 let apScreenshot = null;
 let apReadText = "";
+let apTrace = [];                 // эфемерные шаги текущего цикла автопилота (только в RAM)
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 if(settings.seePage === undefined) settings.seePage = true;
+
+function resetAutopilot(){
+  apStep = 0;
+  apStop = false;
+  apConsecutiveFailures = 0;
+  apPrev = null;
+  apFailed = [];
+  apScreenshot = null;
+  apReadText = "";
+  apTrace = [];
+}
 
 const AP_PROMPT = `Ты AI-ассистент в боковой панели браузера и видишь открытую вкладку (блок [СТРАНИЦА] в сообщении пользователя).
 Если пользователь спрашивает о странице — отвечай по её содержимому.
@@ -377,41 +390,111 @@ function buildCtx(snap, mode, msgs){
 
 // --- хуки в основной код чата ---
 window.HOOKS = {
-  async transformMessages(msgs){
+  onReset(reason){
+    if((reason === "newChat" || reason === "selectChat") && controller){
+      apStop = true;
+      return;
+    }
+    resetAutopilot();
+  },
+
+  async transformMessages(msgs, c){
     if(!settings.seePage) return msgs;
     const snap = await pageSnapshot();
-    const sys = msgs[0]?.role === "system" ? msgs[0] : null;
-    if(sys) sys.content = AP_PROMPT + "\n\n" + sys.content; else msgs.unshift({role:"system", content:AP_PROMPT});
-    const ctx = buildCtx(snap, apStep > 0 ? "diff" : "full", msgs);
+    const rawApCtx = settings.apContext;
+    const apLimit = (rawApCtx === undefined || rawApCtx === null || rawApCtx === "")
+      ? 20
+      : Math.max(0, parseInt(rawApCtx, 10) || 0);
+
+    // 1) Чистая история диалога без текущего пустого placeholder-ассистента и без старых auto-сообщений
+    const rawHistory = (c?.messages || []).slice(0, -1).filter(m => !m.auto && (!m.error || m.content));
+    let lastUserIdx = -1;
+    for(let i = rawHistory.length - 1; i >= 0; i--){
+      if(rawHistory[i].role === "user"){ lastUserIdx = i; break; }
+    }
+
+    let apiMsgs = [];
+    if(apStep > 0 && lastUserIdx >= 0){
+      // Активный цикл автопилота: окно прошлых сообщений ДО текущей задачи + текущая команда + эфемерные шаги apTrace
+      let priorSlice = rawHistory.slice(0, lastUserIdx);
+      if(apLimit === 1){
+        priorSlice = [];
+      } else if(apLimit > 1){
+        priorSlice = priorSlice.slice(-(apLimit - 1));
+      }
+      while(priorSlice.length && priorSlice[0].role === "assistant") priorSlice = priorSlice.slice(1);
+      const priorApi = buildApiMessages({messages: priorSlice}, {
+        limit: 0, includeSystem: false, includeMedia: false, cleanAutopilot: true
+      });
+      const currentUserApi = userMsgToApi(rawHistory[lastUserIdx], {includeMedia: true});
+      apiMsgs = normalizeApiMessages([...priorApi, currentUserApi]);
+
+      const recentTrace = apTrace.slice(-AP_MAX_TRACE);
+      if(apTrace.length > AP_MAX_TRACE){
+        const skipped = apTrace.length - AP_MAX_TRACE;
+        apiMsgs = normalizeApiMessages([
+          ...apiMsgs,
+          {role:"assistant", content:`Выполнил первые ${skipped} шагов задачи.`},
+          {role:"user", content:"Продолжай со следующего шага."}
+        ]);
+      }
+      for(const step of recentTrace){
+        apiMsgs.push({role:"assistant", content:step.assistant});
+        apiMsgs.push({role:"user", content:step.result});
+      }
+    } else {
+      // Новый запрос пользователя (или regen): ограниченное окно очищенной истории
+      let sliced = apLimit > 0 ? rawHistory.slice(-apLimit) : rawHistory;
+      while(sliced.length > 1 && sliced[0].role === "assistant") sliced = sliced.slice(1);
+      apiMsgs = buildApiMessages({messages: sliced}, {
+        limit: 0, includeSystem: false, mediaOnlyLastUser: true, cleanAutopilot: true
+      });
+      if(!apiMsgs.length || apiMsgs[apiMsgs.length - 1].role !== "user"){
+        apiMsgs.push({role:"user", content:"Продолжи выполнение задачи."});
+      }
+    }
+
+    // 2) Всегда актуальный системный промпт в начале
+    const userSys = (settings.system || "").trim();
+    apiMsgs.unshift({role:"system", content: userSys ? (AP_PROMPT + "\n\n" + userSys) : AP_PROMPT});
+
+    // 3) Свежий DOM / список элементов — ТОЛЬКО в текущий API-запрос (не в c.messages и не в Supabase)
+    const ctx = buildCtx(snap, apStep > 0 ? "diff" : "full", apiMsgs)
+      + "\n\n[ФОРМАТ] Для действий на странице используй только команды [CLICK: id], [TYPE: id | текст], [SCROLL: down], [DONE] и т.д. Не пиши лог с эмодзи вместо команд.";
     apPrev = snap && !snap.blocked ? snap : null;
-    for(let i = msgs.length-1; i >= 0; i--){
-      if(msgs[i].role !== "user") continue;
-      if(typeof msgs[i].content === "string") msgs[i].content += ctx;
-      else { const t = msgs[i].content.find(p => p.type === "text"); t ? t.text += ctx : msgs[i].content.unshift({type:"text", text:ctx}); }
+
+    for(let i = apiMsgs.length - 1; i >= 0; i--){
+      if(apiMsgs[i].role !== "user") continue;
+      if(typeof apiMsgs[i].content === "string") apiMsgs[i].content += ctx;
+      else { const t = apiMsgs[i].content.find(p => p.type === "text"); t ? t.text += ctx : apiMsgs[i].content.unshift({type:"text", text:ctx}); }
       if(apReadText){
         const readContext = `\n\n[ДОПОЛНИТЕЛЬНЫЙ ТЕКСТ СТРАНИЦЫ]\n${apReadText}`;
-        if(typeof msgs[i].content === "string") msgs[i].content += readContext;
+        if(typeof apiMsgs[i].content === "string") apiMsgs[i].content += readContext;
         else {
-          const t = msgs[i].content.find(p=>p.type==="text");
-          if(t) t.text += readContext; else msgs[i].content.unshift({type:"text",text:readContext});
+          const t = apiMsgs[i].content.find(p=>p.type==="text");
+          if(t) t.text += readContext; else apiMsgs[i].content.unshift({type:"text",text:readContext});
         }
         apReadText = "";
       }
       if(apScreenshot){
         const image = {type:"image_url", image_url:{url:apScreenshot}};
-        if(typeof msgs[i].content === "string") msgs[i].content = [{type:"text", text:msgs[i].content}, image];
-        else msgs[i].content.push(image);
+        if(typeof apiMsgs[i].content === "string") apiMsgs[i].content = [{type:"text", text:apiMsgs[i].content}, image];
+        else apiMsgs[i].content.push(image);
         apScreenshot = null;
       }
       break;
     }
-    return msgs;
+    return apiMsgs;
   },
 
   async afterGenerate(c, msg, aborted){
-    if(aborted || msg.error || !settings.seePage){ apStep = 0; return; }
+    if(aborted || msg.error || !settings.seePage){ resetAutopilot(); return; }
     let text = msg.content || "";
-    const log = []; let acted = false, failed = false;
+    const rawModelText = splitThink(text).rest.trim();
+    const log = [];
+    const traceLines = [];
+    const okLabels = [];
+    let acted = false, failed = false;
 
     // одно сканирование в порядке появления — действия выполняются как написаны
     const noCodeBlocks = text.replace(/```[\s\S]*?```/g, "");
@@ -462,11 +545,13 @@ window.HOOKS = {
         if(apStop) break;
         if(used >= AP_MAX_ACTIONS){
           log.push(`⏸ ещё ${acts.length-used} действий — в следующем шаге`);
+          traceLines.push(`Оставшиеся ${acts.length-used} действий перенесены на следующий шаг.`);
           for(let j = used; j < acts.length; j++) for(const raw of acts[j].raws) stripRaw(raw);
           break;
         }
         const icon = {type:"⌨️", click:"🖱", enter:"↵", select:"▾", open:"🌐", scroll:"↕️", wait:"⏳", key:"⌨️", hover:"↗️", read:"📖", back:"↩️", shot:"📸"}[a.kind] || "•";
         const hasTargetId = /^(click|type|enter|select|hover)$/.test(a.kind) && a.target;
+        const cmdLabel = a.raws[0] || `[${a.kind.toUpperCase()}${a.target ? ": " + a.target : ""}]`;
         try{
           const r = a.kind === "click"
             ? await clickMany(a.target, a.count, a.delayMs)
@@ -474,12 +559,20 @@ window.HOOKS = {
           const cleanMsg = String(r.msg || "").replace(/\s+/g, " ").trim();
           if(r.ok){
             log.push(hasTargetId ? `${icon} [${a.target}] ${cleanMsg}` : `${icon} ${cleanMsg}`);
+            traceLines.push(`${cmdLabel} -> OK${cleanMsg ? ": " + cleanMsg : ""}`);
+            if(cleanMsg) okLabels.push(cleanMsg);
             acted = true;
           } else {
             log.push(`⚠️ ${a.kind} ${a.target}: ${cleanMsg}`); failed = true;
-            if(apFailed.length < 6 && !apFailed.includes(`${a.kind} ${a.target}`)) apFailed.push(`${a.kind} ${a.target} — ${cleanMsg}`);
+            traceLines.push(`${cmdLabel} -> ОШИБКА: ${cleanMsg}`);
+            const failKey = `${a.kind} ${a.target}`.trim();
+            if(apFailed.length < 6 && !apFailed.some(x => x.startsWith(failKey + " —"))) apFailed.push(`${failKey} — ${cleanMsg}`);
           }
-        }catch(e){ log.push(`⚠️ ${a.kind}: ${String(e.message||e).replace(/\s+/g," ")}`); failed = true; }
+        }catch(e){
+          const errText = String(e.message||e).replace(/\s+/g," ");
+          log.push(`⚠️ ${a.kind}: ${errText}`); failed = true;
+          traceLines.push(`${cmdLabel} -> ОШИБКА: ${errText}`);
+        }
         for(const raw of a.raws) stripRaw(raw);
         used++;
         if(!apStop && a.kind !== "wait" && a.kind !== "scroll") await sleep(200);
@@ -497,25 +590,32 @@ window.HOOKS = {
 
     if(!log.length && !done){
       if(apStep > 0){
+        msg.apSummary = splitThink(msg.content || "").rest.trim() || "Автопилот остановился без следующего действия.";
         msg.content = (msg.content || "").trim() + "\n\n`ℹ️ Автопилот остановлен: модель не указала следующее действие`";
         await persist(c); renderMessages();
       }
-      apStep = 0; return;
+      resetAutopilot(); return;
     }        // обычный ответ без действий
     text = text.replace(/`?\s*(\[DONE\]|\[ERROR:\s*[^\]]+\])\s*`?/gi, "").trim();
     if(terminalError) text += `${text ? "\n\n" : ""}Не удалось выполнить: ${terminalErrorMatch[1].trim()}`;
+
+    // Сохраняем чистый итог для будущей истории API (без эмодзи-логов и «✅ Готово!»),
+    // чтобы модель не имитировала UI-лог вместо команд [CLICK: ...] / [TYPE: ...]
+    const plainProse = splitThink(text).rest.trim();
+    msg.apSummary = plainProse || (okLabels.length ? `Выполнил действия: ${okLabels.slice(0, 5).join(", ")}.` : "Выполнил действия на странице.");
+
     if(log.length) text += "\n\n" + log.map(l => "`"+l.replace(/`/g,"'")+"`").join("  \n");
     if(apStop) text += "\n\n⏹ Остановлено";
     else if(done && !terminalError) text += "\n\n✅ Готово!";
     msg.content = text; await persist(c); renderMessages();
-    if(done || apStop || current() !== c){ apStep = 0; apConsecutiveFailures = 0; apFailed = []; return; }
+    if(done || apStop || current() !== c){ resetAutopilot(); return; }
     if(failed && !acted) apConsecutiveFailures++; else if(acted) apConsecutiveFailures = 0;
     if(apConsecutiveFailures >= 3){
       msg.content += "\n\nАвтопилот остановлен после трёх неудачных попыток. Проверьте страницу и попробуйте другой запрос.";
-      await persist(c); renderMessages(); apStep = 0; apFailed = []; apConsecutiveFailures = 0; return;
+      await persist(c); renderMessages(); resetAutopilot(); return;
     }
-    if(!acted && !failed){ apStep = 0; return; }
-    if(++apStep >= AP_MAX_STEPS){ apStep = 0; toast("Лимит шагов — напишите «продолжай»"); return; }
+    if(!acted && !failed){ resetAutopilot(); return; }
+    if(++apStep >= AP_MAX_STEPS){ resetAutopilot(); toast("Лимит шагов — напишите «продолжай»"); return; }
     if(failed && apFailed.length > 4) apFailed = apFailed.slice(-4);
 
     // пауза между шагами: ждём реального изменения страницы, кнопка ⏹ работает и здесь
@@ -523,17 +623,19 @@ window.HOOKS = {
     controller = new AbortController(); controller.signal.onabort = () => apStop = true; updateSendBtn();
     await waitStable(before);
     controller = null; updateSendBtn();
-    if(apStop || current() !== c){ apStep = 0; return; }
-    c.messages.push({role:"user", auto:true, time:Date.now(), content:
-      `(автопилот: шаг ${apStep} выполнен) Проверь по блоку «что изменилось» и актуальному списку элементов, что вышло, и продолжай со следующей невыполненной задачи. Когда ВСЕ задачи выполнены — итог + [DONE].`});
-    await persist(c);
+    if(apStop || current() !== c){
+      if(apStop && current() === c){ msg.content += "\n\n⏹ Остановлено"; await persist(c); renderMessages(); }
+      resetAutopilot(); return;
+    }
+
+    // Шаг цикла хранится только в RAM (apTrace) и не попадает в c.messages / IndexedDB / Supabase
+    apTrace.push({
+      assistant: rawModelText || acts.map(a => a.raws.join(" ")).join(" "),
+      result: `(автопилот: шаг ${apStep} выполнен)\nРезультаты:\n${traceLines.join("\n")}\nПроверь по блоку [ЧТО ИЗМЕНИЛОСЬ] и актуальному списку элементов, что вышло, и продолжай со следующей невыполненной задачи. Когда ВСЕ задачи выполнены — итог + [DONE].`
+    });
     generate();
   }
 };
-
-// новый запрос пользователя сбрасывает счётчик шагов и память об ошибках
-document.getElementById("sendBtn").addEventListener("click", () => { if(!controller){ apStep = 0; apConsecutiveFailures = 0; apFailed = []; apPrev = null; } }, true);
-document.getElementById("input").addEventListener("keydown", e => { if(e.key==="Enter" && !e.shiftKey){ apStep = 0; apConsecutiveFailures = 0; apFailed = []; apPrev = null; } }, true);
 
 // --- меню «＋»: файл, скриншот, видеть страницу, размышления ---
 if(settings.think === undefined) settings.think = false;
