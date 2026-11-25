@@ -11,6 +11,11 @@ let apFailed = [];                // что уже не сработало — �
 let apScreenshot = null;
 let apReadText = "";
 let apTrace = [];                 // эфемерные шаги текущего цикла автопилота (только в RAM)
+let targetCount = 0;              // целевое число циклов/картинок из запроса пользователя (0 — без автолимита)
+let completedCount = 0;           // счётчик реально выполненных циклов/скачиваний
+let apTaskMsg = null;             // закреплённое исходное сообщение пользователя с текущей задачей
+let apTaskText = "";              // текст исходной задачи пользователя
+let apExpectsDownload = false;    // задача явно упоминает скачивание
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 if(settings.seePage === undefined) settings.seePage = true;
 
@@ -23,6 +28,80 @@ function resetAutopilot(){
   apScreenshot = null;
   apReadText = "";
   apTrace = [];
+  targetCount = 0;
+  completedCount = 0;
+  apTaskMsg = null;
+  apTaskText = "";
+  apExpectsDownload = false;
+}
+
+function parseRuCountToken(tok){
+  const t = String(tok || "").trim().toLowerCase().replace(/ё/g, "е");
+  if(/^\d+$/.test(t)) return parseInt(t, 10);
+  const words = {
+    "один":1, "одна":1, "одну":1, "одного":1,
+    "два":2, "две":2, "двух":2,
+    "три":3, "трех":3,
+    "четыре":4, "четырех":4,
+    "пять":5, "пяти":5,
+    "шесть":6, "шести":6,
+    "семь":7, "семи":7,
+    "восемь":8, "восьми":8,
+    "девять":9, "девяти":9,
+    "десять":10, "десяти":10
+  };
+  return words[t] || 0;
+}
+
+function extractTargetCount(text){
+  const src = String(text || "").trim();
+  if(!src) return 0;
+  const norm = src.toLowerCase().replace(/ё/g, "е");
+  // Убираем разрешения/размеры/время/координаты/проценты, чтобы не путать их с количеством циклов
+  const cleaned = norm
+    .replace(/\b\d+\s*[xх×*]\s*\d+\b/g, " ")
+    .replace(/\b\d+\s*:\s*\d+\b/g, " ")
+    .replace(/\b\d+(?:[.,]\d+)?\s*(?:сек(?:унд[уы]?)?|мин(?:ут[уы]?)?|час(?:а|ов)?|мс|ms|s|px|%|k|к)\b/g, " ");
+  const NUM = "(\\d+|один|одна|одну|одного|два|две|двух|три|трех|четыре|четырех|пять|пяти|шесть|шести|семь|семи|восемь|восьми|девять|девяти|десять|десяти)";
+  const okNum = n => (n >= 1 && n <= 500) ? n : 0;
+
+  // 1) Явные слова «цикл / итерация / повтор / круг / серия»
+  const mCycle = cleaned.match(new RegExp(`(?:^|[^\\p{L}\\d])${NUM}\\s*(?:цикл(?:а|ов)?|итерац(?:ия|ии|ий)|повтор(?:а|ов|ения|ений)?|круг(?:а|ов)?|подход(?:а|ов)?|сери(?:я|и|й)|cycles?|iterations?|loops?)(?=$|[^\\p{L}\\d])`, "u"));
+  if(mCycle){ const n = okNum(parseRuCountToken(mCycle[1])); if(n) return n; }
+
+  // 2) «повтори N раз» / «сделай (всё/это) N раз» (но не «кликни N раз»)
+  const mRep = cleaned.match(new RegExp(`(?:повтор(?:и|ить|яй|ите)|прогон(?:и|ить)|запуст(?:и|ить)|(?:сделай|выполни)(?:\\s+(?:все|это|так))?)\\s+(?:(?:это|все|действие|цикл|еще)\\s+){0,2}${NUM}\\s*раз(?:а)?(?=$|[^\\p{L}\\d])`, "u"));
+  if(mRep){ const n = okNum(parseRuCountToken(mRep[1])); if(n) return n; }
+
+  // 3) Генерация/скачивание N картинок/изображений/фото/файлов/генераций/штук
+  const UNITS = "(?:картин(?:ку|ки|ок|очки|очек)|изображен(?:ие|ия|ий)|фото(?:графи(?:ю|и|й))?|арт(?:а|ов)?|рисун(?:ок|ка|ков)|генерац(?:ию|ии|й)|вариант(?:а|ов)?|файл(?:а|ов)?|видео|ролик(?:а|ов)?|штук(?:у|и)?|шт\\.?|images?|pics?|pictures?|photos?|files?|videos?|items?)";
+  const mGenItem = cleaned.match(new RegExp(`(?:сгенерир|генерир|созда|сдела|скача|сохран|загруз|получ|выгруз|нарису|generate|create|download|save)[^.\\n]{0,50}?(?:^|[^\\p{L}\\d])${NUM}\\s*${UNITS}(?=$|[^\\p{L}\\d])`, "u"));
+  if(mGenItem){ const n = okNum(parseRuCountToken(mGenItem[1])); if(n) return n; }
+
+  const hasWorkflowVerb = /(?:сгенерир|генерир|созда|скача|сохран|выгруз|нарису|повтор|цикл|generate|download|save)/u.test(cleaned);
+  if(hasWorkflowVerb){
+    const mItem = cleaned.match(new RegExp(`(?:^|[^\\p{L}\\d])${NUM}\\s*${UNITS}(?=$|[^\\p{L}\\d])`, "u"));
+    if(mItem){ const n = okNum(parseRuCountToken(mItem[1])); if(n) return n; }
+    // «N раза сгенерируй и скачай» (исключаем кликеры «кликни/нажми N раз»)
+    const mTimes = cleaned.match(new RegExp(`(?:^|[^\\p{L}\\d])${NUM}\\s*раз(?:а)?(?=$|[^\\p{L}\\d])`, "u"));
+    if(mTimes){
+      const before = cleaned.slice(Math.max(0, mTimes.index - 24), mTimes.index);
+      if(!/(?:клик|нажм|жми|тап|click|tap)/u.test(before)){
+        const n = okNum(parseRuCountToken(mTimes[1]));
+        if(n) return n;
+      }
+    }
+  }
+  return 0;
+}
+
+function isDownloadTextMatch(text, allowGenericSave = false){
+  const s = String(text || "");
+  if(!s) return false;
+  if(/(?:upload|загрузи(?:ть)?\s*(?:с\s*комп|с\s*устройств|файл|изображен|фото)|настройк|профил|settings|profile)/i.test(s)) return false;
+  if(/(?:скача|download|save[\s_-]*(?:image|img|file|photo|pic|png|jpg|jpeg|webp|video|as)|сохрани(?:ть)?[\s_-]+(?:картинк|изображен|фото|файл|видео|как))/i.test(s)) return true;
+  if(allowGenericSave && /(?:^|[^\p{L}])(?:сохрани(?:ть)?|save)(?=$|[^\p{L}])/iu.test(s)) return true;
+  return false;
 }
 
 const AP_PROMPT = `Ты AI-ассистент в боковой панели браузера и видишь открытую вкладку (блок [СТРАНИЦА] в сообщении пользователя).
@@ -59,6 +138,7 @@ const AP_PROMPT = `Ты AI-ассистент в боковой панели б�
 6. [DONE] — только когда ВСЕ задачи выполнены, с кратким итогом.
 7. Совсем невозможно → [ERROR: причина].
 8. Снимок [SHOT] появится в следующем сообщении пользователя; используй его вместе со списком элементов.
+9. Если указан блок [СТАТУС ЦИКЛА] (Выполнено X из Y) — выполняй по одному циклу за раз; в конце каждого завершённого цикла добавляй [CYCLE_DONE] и не начинай лишние циклы сверх Y.
 На обычные вопросы отвечай без действий.`;
 
 async function getTargetTab(){
@@ -313,6 +393,22 @@ async function actOnPage(kind, target, value){
     }
     const r = el.getBoundingClientRect();
     const cx = r.left + r.width/2, cy = r.top + r.height/2;
+    const dlAnchor = el.closest?.("a[download], a[href]");
+    const dlHref = dlAnchor?.getAttribute("href") || "";
+    const isDropdownToggle = !!(el.getAttribute("aria-haspopup") || el.hasAttribute("aria-expanded"));
+    const dlMeta = [
+      el.innerText, el.value, el.getAttribute("aria-label"), el.getAttribute("title"),
+      el.getAttribute("data-testid"), el.getAttribute("data-tooltip"), el.id,
+      typeof el.className === "string" ? el.className : "",
+      dlAnchor?.getAttribute("aria-label"), dlAnchor?.getAttribute("title"),
+      el.querySelector?.("svg title")?.textContent, el.querySelector?.("img")?.alt
+    ].filter(Boolean).join(" ");
+    const hasDlAttr = el.hasAttribute("download") || !!el.closest?.("[download]");
+    const hasDlHref = /^(blob:|data:)/i.test(dlHref) || /[/?&=](?:download|export)\b/i.test(dlHref);
+    const isExcludedDl = /(?:upload|загрузи(?:ть)?\s*(?:с\s*комп|с\s*устройств|файл|изображен|фото)|настройк|профил|settings|profile)/i.test(dlMeta);
+    const hasDlText = !isExcludedDl && /(?:скача|download|save[\s_-]*(?:image|img|file|photo|pic|png|jpg|jpeg|webp|video|as)|сохрани(?:ть)?[\s_-]+(?:картинк|изображен|фото|файл|видео|как))/i.test(dlMeta);
+    const isDownload = !isDropdownToggle && (hasDlAttr || hasDlHref || hasDlText);
+    const isSave = !isDropdownToggle && !isExcludedDl && /(?:^|[^\p{L}])(?:сохрани(?:ть)?|save)(?=$|[^\p{L}])/iu.test(dlMeta);
     const base = {bubbles:true, cancelable:true, view:window, clientX:cx, clientY:cy, button:0};
     const ptrDown = {...base, pointerId:1, pointerType:"mouse", isPrimary:true, buttons:1};
     const ptrUp   = {...base, pointerId:1, pointerType:"mouse", isPrimary:true, buttons:0};
@@ -333,7 +429,7 @@ async function actOnPage(kind, target, value){
     el.dispatchEvent(new MouseEvent("mouseup", {...base, buttons:0}));
     if(typeof el.click === "function") el.click();
     else el.dispatchEvent(new MouseEvent("click", base));
-    return {ok:true, msg:name, cx, cy};
+    return {ok:true, msg:name, cx, cy, isDownload, isSave};
   }});
   return res?.result || {ok:false, msg:"нет результата"};
 }
@@ -413,10 +509,22 @@ window.HOOKS = {
       if(rawHistory[i].role === "user"){ lastUserIdx = i; break; }
     }
 
+    // При старте новой задачи закрепляем исходное сообщение пользователя и извлекаем targetCount
+    if(apStep === 0 && lastUserIdx >= 0){
+      apTaskMsg = rawHistory[lastUserIdx];
+      apTaskText = (apTaskMsg.content || "").trim();
+      targetCount = extractTargetCount(apTaskText);
+      completedCount = 0;
+      apExpectsDownload = /(?:скача|download)/i.test(apTaskText);
+    }
+
     let apiMsgs = [];
-    if(apStep > 0 && lastUserIdx >= 0){
-      // Активный цикл автопилота: окно прошлых сообщений ДО текущей задачи + текущая команда + эфемерные шаги apTrace
-      let priorSlice = rawHistory.slice(0, lastUserIdx);
+    if(apStep > 0 && (apTaskMsg || lastUserIdx >= 0)){
+      // Активный цикл автопилота: окно прошлых сообщений ДО текущей задачи + ЗАКРЕПЛЁННАЯ текущая задача + эфемерные шаги apTrace
+      const taskIdx = apTaskMsg ? rawHistory.lastIndexOf(apTaskMsg) : lastUserIdx;
+      const anchorIdx = taskIdx >= 0 ? taskIdx : lastUserIdx;
+      const pinnedMsg = apTaskMsg || rawHistory[anchorIdx];
+      let priorSlice = anchorIdx > 0 ? rawHistory.slice(0, anchorIdx) : [];
       if(apLimit === 1){
         priorSlice = [];
       } else if(apLimit > 1){
@@ -426,15 +534,18 @@ window.HOOKS = {
       const priorApi = buildApiMessages({messages: priorSlice}, {
         limit: 0, includeSystem: false, includeMedia: false, cleanAutopilot: true
       });
-      const currentUserApi = userMsgToApi(rawHistory[lastUserIdx], {includeMedia: true});
+      const currentUserApi = userMsgToApi(pinnedMsg, {includeMedia: true});
       apiMsgs = normalizeApiMessages([...priorApi, currentUserApi]);
 
       const recentTrace = apTrace.slice(-AP_MAX_TRACE);
       if(apTrace.length > AP_MAX_TRACE){
         const skipped = apTrace.length - AP_MAX_TRACE;
+        const skippedNote = targetCount > 0
+          ? `Выполнил первые ${skipped} шагов задачи (сейчас выполнено ${completedCount} из ${targetCount}).`
+          : `Выполнил первые ${skipped} шагов задачи.`;
         apiMsgs = normalizeApiMessages([
           ...apiMsgs,
-          {role:"assistant", content:`Выполнил первые ${skipped} шагов задачи.`},
+          {role:"assistant", content:skippedNote},
           {role:"user", content:"Продолжай со следующего шага."}
         ]);
       }
@@ -443,7 +554,7 @@ window.HOOKS = {
         apiMsgs.push({role:"user", content:step.result});
       }
     } else {
-      // Новый запрос пользователя (или regen): ограниченное окно очищенной истории
+      // Новый запрос пользователя (или regen): ограниченное окно очищенной истории (исходная текущая задача в конце не обрезается)
       let sliced = apLimit > 0 ? rawHistory.slice(-apLimit) : rawHistory;
       while(sliced.length > 1 && sliced[0].role === "assistant") sliced = sliced.slice(1);
       apiMsgs = buildApiMessages({messages: sliced}, {
@@ -458,8 +569,18 @@ window.HOOKS = {
     const userSys = (settings.system || "").trim();
     apiMsgs.unshift({role:"system", content: userSys ? (AP_PROMPT + "\n\n" + userSys) : AP_PROMPT});
 
-    // 3) Свежий DOM / список элементов — ТОЛЬКО в текущий API-запрос (не в c.messages и не в Supabase)
+    // 3) Свежий DOM / список элементов + закреплённый статус цикла — ТОЛЬКО в текущий API-запрос
+    let statusBlock = "";
+    if(apStep > 0 && apTaskText){
+      statusBlock += `\n\n[ИСХОДНАЯ ЗАДАЧА]\n${apTaskText.slice(0, 1000)}`;
+    }
+    if(targetCount > 0){
+      const remaining = Math.max(0, targetCount - completedCount);
+      statusBlock += `\n\n[СТАТУС ЦИКЛА]\nВыполнено ${completedCount} из ${targetCount} (осталось: ${remaining}).`
+        + `\nВыполняй по одному циклу за раз; по завершении каждого цикла добавляй [CYCLE_DONE]. Не начинай новый цикл, если уже выполнено ${targetCount} из ${targetCount}.`;
+    }
     const ctx = buildCtx(snap, apStep > 0 ? "diff" : "full", apiMsgs)
+      + statusBlock
       + "\n\n[ФОРМАТ] Для действий на странице используй только команды [CLICK: id], [TYPE: id | текст], [SCROLL: down], [DONE] и т.д. Не пиши лог с эмодзи вместо команд.";
     apPrev = snap && !snap.blocked ? snap : null;
 
@@ -494,7 +615,10 @@ window.HOOKS = {
     const log = [];
     const traceLines = [];
     const okLabels = [];
+    const prevItemsMap = new Map((apPrev?.items || []).map(i => [i.id, i.line]));
     let acted = false, failed = false;
+    let stepDownloads = 0;
+    let reachedTarget = false;
 
     // одно сканирование в порядке появления — действия выполняются как написаны
     const noCodeBlocks = text.replace(/```[\s\S]*?```/g, "");
@@ -552,6 +676,7 @@ window.HOOKS = {
         const icon = {type:"⌨️", click:"🖱", enter:"↵", select:"▾", open:"🌐", scroll:"↕️", wait:"⏳", key:"⌨️", hover:"↗️", read:"📖", back:"↩️", shot:"📸"}[a.kind] || "•";
         const hasTargetId = /^(click|type|enter|select|hover)$/.test(a.kind) && a.target;
         const cmdLabel = a.raws[0] || `[${a.kind.toUpperCase()}${a.target ? ": " + a.target : ""}]`;
+        let hitTargetNow = false;
         try{
           const r = a.kind === "click"
             ? await clickMany(a.target, a.count, a.delayMs)
@@ -562,6 +687,27 @@ window.HOOKS = {
             traceLines.push(`${cmdLabel} -> OK${cleanMsg ? ": " + cleanMsg : ""}`);
             if(cleanMsg) okLabels.push(cleanMsg);
             acted = true;
+            // Засчитываем завершённый цикл при успешном клике по скачиванию
+            if(targetCount > 0 && a.kind === "click" && a.count === 1){
+              const prevLine = prevItemsMap.get(a.target) || "";
+              const allowSave = !apExpectsDownload;
+              const isCycleDownload = !!(
+                r.isDownload ||
+                (allowSave && r.isSave) ||
+                isDownloadTextMatch(cleanMsg, allowSave) ||
+                isDownloadTextMatch(prevLine, allowSave)
+              );
+              if(isCycleDownload){
+                stepDownloads++;
+                completedCount++;
+                log.push(`📊 Выполнено ${completedCount} из ${targetCount}`);
+                traceLines.push(`Выполнено ${completedCount} из ${targetCount}.`);
+                if(completedCount >= targetCount){
+                  reachedTarget = true;
+                  hitTargetNow = true;
+                }
+              }
+            }
           } else {
             log.push(`⚠️ ${a.kind} ${a.target}: ${cleanMsg}`); failed = true;
             traceLines.push(`${cmdLabel} -> ОШИБКА: ${cleanMsg}`);
@@ -575,6 +721,11 @@ window.HOOKS = {
         }
         for(const raw of a.raws) stripRaw(raw);
         used++;
+        if(hitTargetNow){
+          // Жёсткая остановка: отменяем все оставшиеся действия в этом ответе, чтобы не начать лишний цикл
+          for(let j = used; j < acts.length; j++) for(const raw of acts[j].raws) stripRaw(raw);
+          break;
+        }
         if(!apStop && a.kind !== "wait" && a.kind !== "scroll") await sleep(200);
       }
     } finally {
@@ -585,8 +736,18 @@ window.HOOKS = {
     const executableRemainder = remainderNoBlocks.replace(/`[^`]*`/g, "");
     const terminalErrorMatch = executableRemainder.match(/\[ERROR:\s*([^\]]+)\]/i) || remainderNoBlocks.match(/\[ERROR:\s*([^\]]+)\]/i);
     const terminalError = !!terminalErrorMatch;
+    const hasCycleDone = /\[CYCLE_DONE\]/i.test(executableRemainder) || /\[CYCLE_DONE\]/i.test(remainderNoBlocks);
     const hasDone = /\[DONE\]/i.test(executableRemainder) || /\[DONE\]/i.test(remainderNoBlocks);
-    const done = terminalError || (!apStop && hasDone && used >= acts.length && !failed);
+
+    // Если в этом шаге не было авто-детекта скачивания, но модель отметила завершение цикла тегом [CYCLE_DONE]
+    if(targetCount > 0 && !reachedTarget && stepDownloads === 0 && hasCycleDone && !failed && !apStop){
+      completedCount++;
+      log.push(`📊 Выполнено ${completedCount} из ${targetCount}`);
+      traceLines.push(`Выполнено ${completedCount} из ${targetCount}.`);
+      if(completedCount >= targetCount) reachedTarget = true;
+    }
+
+    const done = reachedTarget || terminalError || (!apStop && hasDone && used >= acts.length && !failed);
 
     if(!log.length && !done){
       if(apStep > 0){
@@ -596,26 +757,34 @@ window.HOOKS = {
       }
       resetAutopilot(); return;
     }        // обычный ответ без действий
-    text = text.replace(/`?\s*(\[DONE\]|\[ERROR:\s*[^\]]+\])\s*`?/gi, "").trim();
+    text = text.replace(/`?\s*(\[DONE\]|\[CYCLE_DONE\]|\[ERROR:\s*[^\]]+\])\s*`?/gi, "").trim();
     if(terminalError) text += `${text ? "\n\n" : ""}Не удалось выполнить: ${terminalErrorMatch[1].trim()}`;
 
     // Сохраняем чистый итог для будущей истории API (без эмодзи-логов и «✅ Готово!»),
     // чтобы модель не имитировала UI-лог вместо команд [CLICK: ...] / [TYPE: ...]
     const plainProse = splitThink(text).rest.trim();
-    msg.apSummary = plainProse || (okLabels.length ? `Выполнил действия: ${okLabels.slice(0, 5).join(", ")}.` : "Выполнил действия на странице.");
+    if(reachedTarget){
+      msg.apSummary = plainProse
+        ? `${plainProse} (Выполнено ${completedCount} из ${targetCount}.)`
+        : `Выполнено ${completedCount} из ${targetCount}.`;
+    } else {
+      msg.apSummary = plainProse || (okLabels.length ? `Выполнил действия: ${okLabels.slice(0, 5).join(", ")}.` : "Выполнил действия на странице.");
+    }
 
     if(log.length) text += "\n\n" + log.map(l => "`"+l.replace(/`/g,"'")+"`").join("  \n");
-    if(apStop) text += "\n\n⏹ Остановлено";
-    else if(done && !terminalError) text += "\n\n✅ Готово!";
+    if(reachedTarget) text += `\n\n✅ Выполнено ${completedCount} из ${targetCount} — автопилот завершён!`;
+    else if(apStop) text += "\n\n⏹ Остановлено";
+    else if(done && !terminalError) text += targetCount > 0 ? `\n\n✅ Готово! Выполнено ${completedCount} из ${targetCount}.` : "\n\n✅ Готово!";
     msg.content = text; await persist(c); renderMessages();
-    if(done || apStop || current() !== c){ resetAutopilot(); return; }
+    if(reachedTarget || done || apStop || current() !== c){ resetAutopilot(); return; }
     if(failed && !acted) apConsecutiveFailures++; else if(acted) apConsecutiveFailures = 0;
     if(apConsecutiveFailures >= 3){
       msg.content += "\n\nАвтопилот остановлен после трёх неудачных попыток. Проверьте страницу и попробуйте другой запрос.";
       await persist(c); renderMessages(); resetAutopilot(); return;
     }
     if(!acted && !failed){ resetAutopilot(); return; }
-    if(++apStep >= AP_MAX_STEPS){ resetAutopilot(); toast("Лимит шагов — напишите «продолжай»"); return; }
+    const maxSteps = targetCount > 0 ? Math.max(AP_MAX_STEPS, Math.min(200, targetCount * 10)) : AP_MAX_STEPS;
+    if(++apStep >= maxSteps){ resetAutopilot(); toast("Лимит шагов — напишите «продолжай»"); return; }
     if(failed && apFailed.length > 4) apFailed = apFailed.slice(-4);
 
     // пауза между шагами: ждём реального изменения страницы, кнопка ⏹ работает и здесь
@@ -629,9 +798,10 @@ window.HOOKS = {
     }
 
     // Шаг цикла хранится только в RAM (apTrace) и не попадает в c.messages / IndexedDB / Supabase
+    const progressLine = targetCount > 0 ? `\nВыполнено ${completedCount} из ${targetCount}.` : "";
     apTrace.push({
       assistant: rawModelText || acts.map(a => a.raws.join(" ")).join(" "),
-      result: `(автопилот: шаг ${apStep} выполнен)\nРезультаты:\n${traceLines.join("\n")}\nПроверь по блоку [ЧТО ИЗМЕНИЛОСЬ] и актуальному списку элементов, что вышло, и продолжай со следующей невыполненной задачи. Когда ВСЕ задачи выполнены — итог + [DONE].`
+      result: `(автопилот: шаг ${apStep} выполнен)${progressLine}\nРезультаты:\n${traceLines.join("\n")}\nПроверь по блоку [ЧТО ИЗМЕНИЛОСЬ] и актуальному списку элементов, что вышло, и продолжай со следующей невыполненной задачи. Когда ВСЕ задачи выполнены — итог + [DONE].`
     });
     generate();
   }
@@ -666,7 +836,7 @@ document.getElementById("attachBtn").addEventListener("click", closeMenu);
 paintModes();
 
 // версия расширения из manifest.json
-const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.5";
+const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.6";
 document.querySelectorAll("[data-ver]").forEach(el => { el.textContent = "v" + EXT_VERSION; });
 
 // размышления: OpenRouter использует reasoning, остальные OpenAI-совместимые: reasoning_effort
