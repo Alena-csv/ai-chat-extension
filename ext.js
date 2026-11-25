@@ -666,7 +666,7 @@ document.getElementById("attachBtn").addEventListener("click", closeMenu);
 paintModes();
 
 // версия расширения из manifest.json
-const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.4";
+const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.5";
 document.querySelectorAll("[data-ver]").forEach(el => { el.textContent = "v" + EXT_VERSION; });
 
 // размышления: OpenRouter использует reasoning, остальные OpenAI-совместимые: reasoning_effort
