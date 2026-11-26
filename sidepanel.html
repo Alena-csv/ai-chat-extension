@@ -167,13 +167,13 @@ body{font-size:14px}
       <input id="search" placeholder="Поиск по чатам…">
     </div>
     <div class="chat-list" id="chatList"></div>
-    <div class="side-bottom"><button class="btn" style="width:100%" id="openSettings2">⚙️ Настройки</button><div class="side-ver" data-ver>v2.6</div></div>
+    <div class="side-bottom"><button class="btn" style="width:100%" id="openSettings2">⚙️ Настройки</button><div class="side-ver" data-ver>v2.7</div></div>
   </aside>
   <main class="main">
     <div class="topbar">
       <button class="icon-btn" id="toggleSide" title="Меню"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg></button>
       <div class="title" id="chatTitle">Новый чат</div>
-      <span class="ver-badge" data-ver title="Версия расширения">v2.6</span>
+      <span class="ver-badge" data-ver title="Версия расширения">v2.7</span>
       <select id="providerSel" title="Провайдер"></select>
       <select id="modelSel" title="Модель"></select>
       <button class="icon-btn" id="syncBadge" title="Синхронизация">💾</button>
@@ -207,7 +207,7 @@ body{font-size:14px}
 
 <div class="modal-bg" id="settingsModal">
   <div class="modal">
-    <div class="modal-head"><h2>Настройки <span class="ver-badge" data-ver>v2.6</span></h2><button class="icon-btn" id="closeSettings">✕</button></div>
+    <div class="modal-head"><h2>Настройки <span class="ver-badge" data-ver>v2.7</span></h2><button class="icon-btn" id="closeSettings">✕</button></div>
     <div class="tabs">
       <button class="tab active" data-tab="model">Модель</button>
       <button class="tab" data-tab="keys">API-ключи</button>
@@ -250,6 +250,7 @@ body{font-size:14px}
         <div class="field"><label>Max tokens (пусто — по умолчанию)</label><input type="number" id="sMaxTokens" min="1"></div>
         <div class="field"><label>Сколько последних сообщений отправлять как контекст (0 — все)</label><input type="number" id="sContext" min="0"></div>
         <div class="field"><label>Контекст в режиме автопилота / «Видеть страницу» (последних сообщений, 0 — все)</label><input type="number" id="sApContext" min="0" placeholder="20"></div>
+        <div class="field"><label>Мин. интервал между шагами автопилота, сек (0 — без паузы)</label><input type="number" id="sApDelay" min="0" step="0.5" placeholder="6"></div>
         <div class="field check"><input type="checkbox" id="sStream"><label for="sStream" style="margin:0;color:var(--text)">Потоковый вывод (streaming)</label></div>
         <div class="field check"><input type="checkbox" id="sAutoTitle"><label for="sAutoTitle" style="margin:0;color:var(--text)">Автоназвание чата по первому сообщению</label></div>
       </div>

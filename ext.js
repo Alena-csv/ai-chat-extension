@@ -787,10 +787,22 @@ window.HOOKS = {
     if(++apStep >= maxSteps){ resetAutopilot(); toast("Лимит шагов — напишите «продолжай»"); return; }
     if(failed && apFailed.length > 4) apFailed = apFailed.slice(-4);
 
-    // пауза между шагами: ждём реального изменения страницы, кнопка ⏹ работает и здесь
+    // пауза между шагами: ждём реального изменения страницы + выдерживаем минимальный интервал между запросами
     apStop = false;
     controller = new AbortController(); controller.signal.onabort = () => apStop = true; updateSendBtn();
     await waitStable(before);
+    const rawDelay = settings.apDelay;
+    const minIntervalMs = ((rawDelay === undefined || rawDelay === null || rawDelay === "") ? 6 : Math.max(0, parseFloat(rawDelay) || 0)) * 1000;
+    if(!apStop && minIntervalMs > 0 && lastApiReqTs > 0){
+      const leftMs = minIntervalMs - (Date.now() - lastApiReqTs);
+      if(leftMs > 150){
+        toast(`⏳ Пауза ${Math.ceil(leftMs / 1000)} с (лимит запросов)…`);
+        const endAt = Date.now() + leftMs;
+        while(!apStop && current() === c && Date.now() < endAt){
+          await sleep(Math.min(200, endAt - Date.now()));
+        }
+      }
+    }
     controller = null; updateSendBtn();
     if(apStop || current() !== c){
       if(apStop && current() === c){ msg.content += "\n\n⏹ Остановлено"; await persist(c); renderMessages(); }
@@ -836,7 +848,7 @@ document.getElementById("attachBtn").addEventListener("click", closeMenu);
 paintModes();
 
 // версия расширения из manifest.json
-const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.6";
+const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.7";
 document.querySelectorAll("[data-ver]").forEach(el => { el.textContent = "v" + EXT_VERSION; });
 
 // размышления: OpenRouter использует reasoning, остальные OpenAI-совместимые: reasoning_effort

@@ -27,7 +27,7 @@ const DEFAULTS = {
   provider:"anymodel", model:"cx/gpt-5.6-luna", customModel:"",
   keys:{anymodel:"",darkapi:"",openrouter:"",nyxos:"",xkiro:"",tooken:"",ghostly:""},
   baseUrls:{}, fetchedModels:{}, customProviders:{},
-  system:"", temperature:0.7, maxTokens:"", context:0, apContext:20, stream:true, autoTitle:true,
+  system:"", temperature:0.7, maxTokens:"", context:0, apContext:20, apDelay:6, stream:true, autoTitle:true,
   syncUrl:"", syncKey:"", syncCode:""
 };
 
@@ -42,6 +42,7 @@ let chats = [];           // [{id,title,created,updated,provider,model,messages:
 let currentId = null;
 let pending = [];         // вложения до отправки
 let controller = null;    // AbortController текущего запроса
+let lastApiReqTs = 0;     // время последнего запроса к API (для контроля интервала)
 
 function loadSettings(){
   try{
@@ -381,6 +382,36 @@ function buildApiMessages(c, opts = {}){
   return out;
 }
 
+function parseRetryDelayMs(res, errText, attempt){
+  const ra = res.headers?.get?.("retry-after");
+  if(ra){
+    const sec = parseFloat(ra);
+    if(Number.isFinite(sec) && sec > 0) return Math.min(60000, Math.ceil(sec * 1000) + 500);
+    const dt = Date.parse(ra);
+    if(Number.isFinite(dt)){
+      const diff = dt - Date.now();
+      if(diff > 0) return Math.min(60000, diff + 500);
+    }
+  }
+  const s = String(errText || "");
+  const mMs = s.match(/try again in\s+(\d+(?:\.\d+)?)\s*ms/i);
+  if(mMs) return Math.min(60000, Math.ceil(parseFloat(mMs[1])) + 500);
+  const mSec = s.match(/try again in\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?/i);
+  if(mSec) return Math.min(60000, Math.ceil(parseFloat(mSec[1]) * 1000) + 500);
+  const mMin = s.match(/try again in\s+(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?/i);
+  if(mMin) return Math.min(60000, Math.ceil(parseFloat(mMin[1]) * 60000) + 500);
+  return Math.min(15000, (attempt + 1) * 2500);
+}
+
+function abortableSleep(ms, signal){
+  return new Promise((resolve, reject) => {
+    if(signal?.aborted) return reject(Object.assign(new Error("Aborted"), {name:"AbortError"}));
+    const onAbort = () => { clearTimeout(t); reject(Object.assign(new Error("Aborted"), {name:"AbortError"})); };
+    const t = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, ms);
+    signal?.addEventListener("abort", onAbort, {once:true});
+  });
+}
+
 async function generate(){
   const c = current(); const p = settings.provider; const key = settings.keys[p]; const model = activeModel();
   const pDef = providerOf(p);
@@ -409,10 +440,27 @@ async function generate(){
 
   let aborted = false;
   try{
-    let res = await fetch(baseUrlOf(p)+"/chat/completions", {method:"POST", headers, body:JSON.stringify(body), signal:controller.signal});
-    if(!res.ok && res.status===400 && (body.reasoning || body.reasoning_effort)){ // модель не поддерживает размышления: повторяем без них
-      delete body.reasoning; delete body.reasoning_effort;
+    const MAX_429_RETRIES = 4;
+    let res;
+    for(let attempt = 0; attempt <= MAX_429_RETRIES; attempt++){
+      lastApiReqTs = Date.now();
       res = await fetch(baseUrlOf(p)+"/chat/completions", {method:"POST", headers, body:JSON.stringify(body), signal:controller.signal});
+      if(!res.ok && res.status===400 && (body.reasoning || body.reasoning_effort)){ // модель не поддерживает размышления: повторяем без них
+        delete body.reasoning; delete body.reasoning_effort;
+        lastApiReqTs = Date.now();
+        res = await fetch(baseUrlOf(p)+"/chat/completions", {method:"POST", headers, body:JSON.stringify(body), signal:controller.signal});
+      }
+      if(res.status === 429 && attempt < MAX_429_RETRIES){
+        let t = await res.text();
+        try{ const j = JSON.parse(t); t = j.error?.message || j.message || t; }catch{}
+        const waitMs = parseRetryDelayMs(res, t, attempt);
+        const sec = Math.max(1, Math.ceil(waitMs / 1000));
+        bodyEl.innerHTML = `<div class="small">⏳ Лимит запросов (429), повтор через ${sec} с (попытка ${attempt + 1}/${MAX_429_RETRIES})…</div>`;
+        await abortableSleep(waitMs, controller.signal);
+        bodyEl.innerHTML = "";
+        continue;
+      }
+      break;
     }
     if(!res.ok){
       let t = await res.text(); try{ const j = JSON.parse(t); t = j.error?.message || j.message || t; }catch{}
@@ -530,6 +578,7 @@ function openSettings(){
   $("#sSystem").value = draft.system; $("#sTemp").value = draft.temperature; $("#tempVal").textContent = draft.temperature;
   $("#sMaxTokens").value = draft.maxTokens; $("#sContext").value = draft.context;
   const apCtxEl = $("#sApContext"); if(apCtxEl) apCtxEl.value = draft.apContext ?? DEFAULTS.apContext;
+  const apDelayEl = $("#sApDelay"); if(apDelayEl) apDelayEl.value = draft.apDelay ?? DEFAULTS.apDelay;
   $("#sStream").checked = draft.stream; $("#sAutoTitle").checked = draft.autoTitle;
   $("#sSyncUrl").value = draft.syncUrl||""; $("#sSyncKey").value = draft.syncKey||""; $("#sSyncCode").value = draft.syncCode||"";
   $("#fetchStatus").textContent = "";
@@ -639,8 +688,13 @@ function collectDraft(){
   draft.context = Math.max(0, parseInt($("#sContext").value, 10) || 0);
   const apCtxEl = $("#sApContext");
   if(apCtxEl){
-    const rawApCtx = apCtxEl.value.trim();
+    const rawApCtx = String(apCtxEl.value ?? "").trim();
     draft.apContext = rawApCtx === "" ? DEFAULTS.apContext : Math.max(0, parseInt(rawApCtx, 10) || 0);
+  }
+  const apDelayEl = $("#sApDelay");
+  if(apDelayEl){
+    const rawApDelay = String(apDelayEl.value ?? "").trim();
+    draft.apDelay = rawApDelay === "" ? DEFAULTS.apDelay : Math.max(0, parseFloat(rawApDelay) || 0);
   }
   draft.stream = $("#sStream").checked; draft.autoTitle = $("#sAutoTitle").checked;
 }
