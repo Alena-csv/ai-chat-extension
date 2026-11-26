@@ -157,6 +157,25 @@ body{font-size:14px}
 .badge-custom{font-size:11px;background:rgba(77,124,255,.18);border:1px solid rgba(77,124,255,.4);color:var(--accent2);border-radius:6px;padding:1px 6px;margin-left:4px}
 .ver-badge{font-size:11px;color:var(--muted);background:var(--panel);border:1px solid var(--border);border-radius:6px;padding:1px 6px;flex-shrink:0;white-space:nowrap}
 .side-ver{text-align:center;font-size:11px;color:var(--muted);margin-top:6px;opacity:.8}
+/* умная подстановка */
+.smart-panel{max-width:860px;margin:0 auto 8px;display:flex;flex-direction:column;gap:6px}
+.smart-actions{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.smart-btn{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;padding:5px 10px;border-radius:10px;background:rgba(77,124,255,.16);border:1px solid rgba(77,124,255,.45);color:var(--text);transition:background .15s,border-color .15s}
+.smart-btn:hover{background:rgba(77,124,255,.28);border-color:var(--accent2)}
+.smart-btn.busy{background:rgba(255,180,60,.16);border-color:rgba(255,180,60,.5)}
+.smart-btn.undo{background:var(--panel);border-color:var(--border);color:var(--muted)}
+.smart-btn.undo:hover{background:var(--panel2);color:var(--text)}
+.smart-card{display:none;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:8px 10px;font-size:12.5px}
+.smart-card.show{display:block}
+.smart-card-head{display:flex;align-items:center;gap:6px;justify-content:space-between}
+.smart-badge{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;padding:2px 7px;border-radius:12px;background:rgba(77,124,255,.18);border:1px solid rgba(77,124,255,.4);color:var(--accent2)}
+.smart-card-tools{display:flex;align-items:center;gap:4px}
+.smart-mini{background:none;border:1px solid transparent;border-radius:6px;color:var(--muted);padding:2px 6px;font-size:12px}
+.smart-mini:hover{background:var(--panel);border-color:var(--border);color:var(--text)}
+.smart-warn{display:none;margin-top:7px;padding:7px 9px;border-radius:8px;background:rgba(255,176,32,.12);border:1px solid rgba(255,176,32,.45);color:#ffd580;line-height:1.4;white-space:pre-wrap}
+.smart-warn.show{display:block}
+.smart-err{display:none;margin-top:7px;padding:7px 9px;border-radius:8px;background:rgba(255,93,115,.1);border:1px solid rgba(255,93,115,.4);color:var(--danger);line-height:1.4}
+.smart-err.show{display:block}
 </style>
 </head>
 <body>
@@ -167,13 +186,13 @@ body{font-size:14px}
       <input id="search" placeholder="Поиск по чатам…">
     </div>
     <div class="chat-list" id="chatList"></div>
-    <div class="side-bottom"><button class="btn" style="width:100%" id="openSettings2">⚙️ Настройки</button><div class="side-ver" data-ver>v2.7</div></div>
+    <div class="side-bottom"><button class="btn" style="width:100%" id="openSettings2">⚙️ Настройки</button><div class="side-ver" data-ver>v2.8</div></div>
   </aside>
   <main class="main">
     <div class="topbar">
       <button class="icon-btn" id="toggleSide" title="Меню"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg></button>
       <div class="title" id="chatTitle">Новый чат</div>
-      <span class="ver-badge" data-ver title="Версия расширения">v2.7</span>
+      <span class="ver-badge" data-ver title="Версия расширения">v2.8</span>
       <select id="providerSel" title="Провайдер"></select>
       <select id="modelSel" title="Модель"></select>
       <button class="icon-btn" id="syncBadge" title="Синхронизация">💾</button>
@@ -181,6 +200,23 @@ body{font-size:14px}
     </div>
     <div class="messages" id="messages"></div>
     <div class="composer">
+      <div class="smart-panel" id="smartPanel">
+        <div class="smart-card" id="smartCard">
+          <div class="smart-card-head">
+            <span class="smart-badge" id="smartBadge">✨ Умная подстановка</span>
+            <div class="smart-card-tools">
+              <button class="smart-mini" id="smartCopyBtn" title="Скопировать результат">📋</button>
+              <button class="smart-mini" id="smartCloseBtn" title="Скрыть">✕</button>
+            </div>
+          </div>
+          <div class="smart-warn" id="smartWarn"></div>
+          <div class="smart-err" id="smartErr"></div>
+        </div>
+        <div class="smart-actions">
+          <button class="smart-btn" id="smartFillBtn" type="button" title="Улучшить черновик из активного поля страницы (или из поля ниже) и подставить обратно без отправки">✨ Умная подстановка</button>
+          <button class="smart-btn undo" id="smartUndoBtn" type="button" style="display:none" title="Вернуть исходный черновик в поле на странице">↩️ Вернуть исходный текст</button>
+        </div>
+      </div>
       <div class="composer-inner" id="composer">
         <div class="mode-chips" id="modeChips"></div>
         <div class="pending" id="pending"></div>
@@ -193,6 +229,7 @@ body{font-size:14px}
               <div class="pm-sep"></div>
               <button class="pm-item pm-toggle" id="seePageBtn"><span>👁</span><span>Видеть страницу</span><i class="sw"></i></button>
               <button class="pm-item pm-toggle" id="thinkBtn"><span>💭</span><span>Размышления</span><i class="sw"></i></button>
+              <button class="pm-item pm-toggle" id="floatBtnToggle"><span>✨</span><span>Кнопка у полей ввода</span><i class="sw"></i></button>
             </div>
           </div>
           <input type="file" id="fileInput" multiple hidden>
@@ -207,7 +244,7 @@ body{font-size:14px}
 
 <div class="modal-bg" id="settingsModal">
   <div class="modal">
-    <div class="modal-head"><h2>Настройки <span class="ver-badge" data-ver>v2.7</span></h2><button class="icon-btn" id="closeSettings">✕</button></div>
+    <div class="modal-head"><h2>Настройки <span class="ver-badge" data-ver>v2.8</span></h2><button class="icon-btn" id="closeSettings">✕</button></div>
     <div class="tabs">
       <button class="tab active" data-tab="model">Модель</button>
       <button class="tab" data-tab="keys">API-ключи</button>

@@ -848,8 +848,27 @@ document.getElementById("attachBtn").addEventListener("click", closeMenu);
 paintModes();
 
 // версия расширения из manifest.json
-const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.7";
+const EXT_VERSION = chrome.runtime?.getManifest?.().version || "2.8";
 document.querySelectorAll("[data-ver]").forEach(el => { el.textContent = "v" + EXT_VERSION; });
+
+// переключатель плавающей кнопки у полей ввода (синхронизируется с content.js через chrome.storage.local)
+if(settings.floatBtn === undefined) settings.floatBtn = true;
+function syncFloatBtnSetting(){
+  const el = document.getElementById("floatBtnToggle");
+  if(el) el.classList.toggle("on", !!settings.floatBtn);
+  try{ chrome.storage?.local?.set?.({aichat_float_btn: !!settings.floatBtn}); }catch{}
+}
+const floatToggleEl = document.getElementById("floatBtnToggle");
+if(floatToggleEl){
+  floatToggleEl.onclick = e => {
+    e.stopPropagation();
+    settings.floatBtn = !settings.floatBtn;
+    saveSettingsLS();
+    syncFloatBtnSetting();
+    toast(settings.floatBtn ? "✨ Плавающая кнопка у полей включена" : "Плавающая кнопка у полей скрыта");
+  };
+}
+syncFloatBtnSetting();
 
 // размышления: OpenRouter использует reasoning, остальные OpenAI-совместимые: reasoning_effort
 HOOKS.transformBody = (body, provider) => {
@@ -866,6 +885,543 @@ document.getElementById("shotBtn").onclick = async () => {
     pending.push({type:"image", name:"screenshot.jpg", dataUrl: await compressImage(dataUrl)}); renderPending(); toast("📸 Скриншот добавлен");
   }catch(e){ toast("Не удалось сделать скриншот: "+e.message); }
 };
+
+// ============ УМНАЯ ПОДСТАНОВКА (Smart Fill) ============
+const SMART_FILL_PROMPT = `Ты встроенный инструмент «Умная подстановка» в браузере.
+По контексту страницы, описанию поля ввода и короткому черновику пользователя подготовь готовый текст для подстановки прямо в это поле.
+
+Сначала автоматически определи сценарий по URL, заголовку страницы, подсказке поля и контексту:
+
+1. scenario = "generator" — генератор картинок или видео (Midjourney, Leonardo, Kling, Runway, Sora, Ideogram, Flux, Freepik, Hailuo, Pika, Kandinsky, Шедеврум, Recraft, Krea, Stable Diffusion и т.п. или поле с подсказкой для промпта):
+   - Разверни короткую идею в подробный, выразительный, качественный промпт (объект, композиция, свет, атмосфера, стиль, детали, камера/движение для видео).
+   - Язык: учитывай язык площадки; по умолчанию для генераторов пиши на естественном английском (если площадка русскоязычная, например Шедеврум/Kandinsky, или пользователь явно попросил на русском — пиши на русском).
+   - Только сам готовый промпт, без вступлений вроде «Вот промпт:».
+
+2. scenario = "reply" — мессенджер, почта, чат поддержки или фриланс-биржа (Telegram, WhatsApp, VK, Gmail, Яндекс.Почта, Outlook, Kwork, FL.ru, Avito, Upwork, Slack, Discord и т.п.):
+   - Прочитай контекст диалога (последние видимые сообщения) и перепиши краткий набросок пользователя в естественный, спокойный, уверенный ответ от ЖЕНСКОГО лица (например: «посмотрела», «сделала», «уточнила», «готова»).
+   - Строго БЕЗ канцелярита, подхалимства и штампов: запрещены «доброго времени суток», «с удовольствием помогу», «буду рада сотрудничеству», «заранее спасибо», «к сожалению, вынуждена», «уважаемый». Пиши живо, спокойно и по делу.
+   - Проверь сообщения собеседника на спорные моменты или риски: торг / давление по цене, выход за рамки исходной задачи (бесплатные правки, допработы), нереалистичные сроки, сомнительные условия оплаты/предоплаты, грубость или манипуляция. Если есть риск — напиши короткое (1–2 предложения) практичное предупреждение на русском в поле "warning". Если рисков нет — "warning": "".
+
+3. scenario = "post" — соцсеть, блог, отзыв или форма публикации (Instagram, Pinterest, X/Twitter, LinkedIn, Threads, VK пост, Telegram-канал, YouTube описание, Дзен, комментарии и т.п.):
+   - Оформи черновик под формат и стиль площадки (структура, абзацы, лаконичность, уместные теги только если они реально приняты на площадке). Без воды и штампов.
+
+4. scenario = "general" — любая другая форма или текстовое поле:
+   - Аккуратно оформи и улучши черновик под назначение поля, сохраняя смысл и естественный тон (от женского лица, если от первого лица).
+
+Верни СТРОГО валидный JSON-объект без пояснений вокруг:
+{"scenario":"generator|reply|post|general","text":"готовый текст для поля","warning":"короткое предупреждение о риске или пустая строка"}`;
+
+const SMART_SCENARIO_LABELS = {
+  generator: "🎨 Промпт для генератора",
+  reply:     "💬 Ответ в диалог",
+  post:      "📣 Текст публикации",
+  general:   "✍️ Умная подстановка"
+};
+
+let smartFillLast = null;
+let smartAbort = null;
+
+function parseSmartFillResponse(raw){
+  const cleaned = splitThink(String(raw || "")).rest.trim();
+  if(!cleaned) return {scenario:"general", text:"", warning:""};
+  const candidates = [];
+  const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if(fenced) candidates.push(fenced[1].trim());
+  candidates.push(cleaned);
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if(firstBrace >= 0 && lastBrace > firstBrace) candidates.push(cleaned.slice(firstBrace, lastBrace + 1));
+
+  for(const cand of candidates){
+    try{
+      const j = JSON.parse(cand);
+      if(j && typeof j === "object" && typeof j.text === "string"){
+        const sc = SMART_SCENARIO_LABELS[j.scenario] ? j.scenario : "general";
+        return {
+          scenario: sc,
+          text: j.text.trim(),
+          warning: typeof j.warning === "string" ? j.warning.trim() : ""
+        };
+      }
+    }catch{}
+  }
+  return {
+    scenario: "general",
+    text: cleaned.replace(/^```[\w-]*\n?|\n?```$/g, "").trim(),
+    warning: ""
+  };
+}
+
+function renderSmartUI({busy = false, scenario = "", warning = "", error = "", hasUndo = !!smartFillLast} = {}){
+  const btn = document.getElementById("smartFillBtn");
+  const undoBtn = document.getElementById("smartUndoBtn");
+  const card = document.getElementById("smartCard");
+  const badge = document.getElementById("smartBadge");
+  const warnEl = document.getElementById("smartWarn");
+  const errEl = document.getElementById("smartErr");
+  if(!btn) return;
+
+  btn.classList.toggle("busy", !!busy);
+  btn.textContent = busy ? "⏳ Подставляю… (отмена)" : "✨ Умная подстановка";
+  if(undoBtn) undoBtn.style.display = hasUndo ? "" : "none";
+
+  if(error){
+    if(badge) badge.textContent = "✨ Умная подстановка";
+    if(warnEl){ warnEl.textContent = ""; warnEl.classList.remove("show"); }
+    if(errEl){ errEl.textContent = "⚠️ " + error; errEl.classList.add("show"); }
+    if(card) card.classList.add("show");
+    return;
+  }
+  if(errEl){ errEl.textContent = ""; errEl.classList.remove("show"); }
+  if(scenario || warning){
+    if(badge) badge.textContent = SMART_SCENARIO_LABELS[scenario] || "✨ Подставлено";
+    if(warnEl){
+      if(warning){ warnEl.textContent = "⚠️ " + warning; warnEl.classList.add("show"); }
+      else { warnEl.textContent = ""; warnEl.classList.remove("show"); }
+    }
+    if(card) card.classList.add("show");
+  } else if(!busy && card && !warning){
+    card.classList.remove("show");
+  }
+}
+
+async function collectSmartFieldContext(tab){
+  const token = "sf_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 7);
+  const results = await chrome.scripting.executeScript({
+    target: {tabId: tab.id, allFrames: true},
+    args: [token],
+    func: (tok) => {
+      const IGNORED = new Set(["password","hidden","checkbox","radio","file","button","submit","reset","image","range","color","date","time","month","week"]);
+      const clean = s => String(s || "").replace(/\s+/g, " ").trim();
+      const isEditable = el => {
+        if(!el || el.nodeType !== 1) return false;
+        const tag = el.tagName?.toLowerCase();
+        if(tag === "textarea") return !el.disabled && !el.readOnly;
+        if(tag === "input") return !IGNORED.has((el.type || "text").toLowerCase()) && !el.disabled && !el.readOnly;
+        if(el.isContentEditable) return true;
+        const ce = el.getAttribute?.("contenteditable");
+        return ce === "" || ce === "true" || ce === "plaintext-only";
+      };
+      const isVis = el => {
+        if(!el || !el.isConnected) return false;
+        const r = el.getBoundingClientRect();
+        if(r.width < 20 || r.height < 14) return false;
+        const s = getComputedStyle(el);
+        return s.display !== "none" && s.visibility !== "hidden" && s.opacity !== "0";
+      };
+      const deepActive = () => {
+        let a = document.activeElement;
+        while(a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+        let cur = a;
+        while(cur){
+          if(isEditable(cur)) return cur;
+          if(cur.parentElement) cur = cur.parentElement;
+          else if(cur.getRootNode && cur.getRootNode() instanceof ShadowRoot) cur = cur.getRootNode().host;
+          else break;
+        }
+        return null;
+      };
+      const collectAllEditable = () => {
+        const out = [];
+        const roots = [document];
+        for(let i = 0; i < roots.length; i++){
+          const root = roots[i];
+          for(const host of root.querySelectorAll("*")) if(host.shadowRoot && !roots.includes(host.shadowRoot)) roots.push(host.shadowRoot);
+          for(const el of root.querySelectorAll('textarea, input, [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], [role="textbox"]')){
+            if(isEditable(el) && isVis(el)) out.push(el);
+          }
+        }
+        return out;
+      };
+
+      let target = null, priority = 0, lastTs = 0;
+      const act = deepActive();
+      if(act && isVis(act)){
+        target = act; priority = 3; lastTs = Date.now();
+      } else if(window.__aiLastInput && isEditable(window.__aiLastInput) && isVis(window.__aiLastInput)){
+        target = window.__aiLastInput; priority = 2; lastTs = window.__aiLastInputTs || 1;
+      } else {
+        const all = collectAllEditable();
+        let best = null, bestScore = -1;
+        for(const el of all){
+          const r = el.getBoundingClientRect();
+          const tag = el.tagName.toLowerCase();
+          const meta = `${el.getAttribute("placeholder")||""} ${el.getAttribute("aria-label")||""} ${el.name||""} ${el.id||""}`.toLowerCase();
+          let score = Math.min(400, r.width) * 0.2 + Math.min(200, r.height);
+          if(tag === "textarea" || el.isContentEditable) score += 200;
+          if(/(prompt|message|reply|comment|post|сообщен|ответ|промпт|описан|текст|написать|чат)/i.test(meta)) score += 160;
+          if(/(search|поиск|find|filter)/i.test(meta) && tag === "input") score -= 180;
+          if(score > bestScore){ bestScore = score; best = el; }
+        }
+        if(best){ target = best; priority = 1; lastTs = 0; }
+      }
+
+      const pageMeta = { url: location.href, title: document.title || "", lang: document.documentElement?.lang || "" };
+      if(!target) return { found: false, ...pageMeta };
+
+      target.setAttribute("data-ai-smart-target", tok);
+      const tag = target.tagName.toLowerCase();
+      const isCE = !/^(input|textarea)$/.test(tag);
+      const rawDraft = isCE ? (target.innerText || "").replace(/\r\n/g, "\n").replace(/\n$/, "") : (target.value || "");
+      let labelText = "";
+      if(target.id){
+        try{ const lb = document.querySelector(`label[for="${CSS.escape(target.id)}"]`); if(lb) labelText = clean(lb.innerText); }catch{}
+      }
+      const placeholder = clean(target.getAttribute("placeholder") || target.getAttribute("data-placeholder") || "");
+      const ariaLabel = clean(target.getAttribute("aria-label") || target.getAttribute("title") || labelText || target.name || "");
+
+      // Собираем последние 5–8 видимых сообщений (для чатов/почты/бирж)
+      const msgSelectors = '[data-message-id],[data-mid],[data-testid*="message" i],[class*="message-text" i],[class*="Message_"],[class*="chat-message" i],[class*="msg-text" i],[class*="bubble" i],article,[role="listitem"]';
+      const msgCandidates = [];
+      try{
+        for(const node of document.querySelectorAll(msgSelectors)){
+          if(node === target || node.contains(target) || target.contains(node)) continue;
+          if(!isVis(node)) continue;
+          const r = node.getBoundingClientRect();
+          if(r.width < 40 || r.height < 14 || r.height > window.innerHeight * 0.9) continue;
+          const txt = clean(node.innerText);
+          if(txt.length < 2 || txt.length > 900) continue;
+          msgCandidates.push({ node, txt, rect: r });
+        }
+      }catch{}
+      const leafMsgs = msgCandidates.filter((item, idx) =>
+        !msgCandidates.some((other, j) => j !== idx && item.node.contains(other.node))
+      );
+      const recentMessages = [];
+      const seenTxt = new Set();
+      for(const item of leafMsgs.slice(-14)){
+        if(seenTxt.has(item.txt)) continue;
+        seenTxt.add(item.txt);
+        const cls = String(item.node.className || "").toLowerCase();
+        const isOut = /(?:^|[\s_-])(out|outgoing|own|self|sent|mine|right|me)(?:$|[\s_-])/.test(cls);
+        const isIn  = /(?:^|[\s_-])(in|incoming|received|other|peer|left)(?:$|[\s_-])/.test(cls);
+        const prefix = isOut ? "[Моё] " : (isIn ? "[Собеседник] " : "");
+        recentMessages.push(prefix + item.txt.slice(0, 360));
+      }
+      const lastMessages = recentMessages.slice(-8);
+
+      // Компактный фрагмент видимого текста страницы
+      const headings = [...document.querySelectorAll("h1,h2,h3")].filter(isVis).map(h => clean(h.innerText)).filter(Boolean).slice(0, 6);
+      const bodyText = (document.body?.innerText || "").replace(/\n{3,}/g, "\n\n").trim();
+      const pageSnippet = (headings.length ? `Заголовки: ${headings.join(" | ")}\n\n` : "") + bodyText.slice(0, 1800);
+
+      return {
+        found: true,
+        priority,
+        lastTs,
+        token: tok,
+        tag: isCE ? "contenteditable" : tag,
+        draft: rawDraft,
+        placeholder,
+        ariaLabel,
+        recentMessages: lastMessages,
+        pageSnippet: pageSnippet.slice(0, 2200),
+        ...pageMeta
+      };
+    }
+  });
+
+  const frames = (results || []).filter(r => r.result && !r.error).map(({frameId, result}) => ({frameId, result}));
+  const topFrame = frames.find(f => f.frameId === 0)?.result || null;
+  const found = frames.filter(f => f.result.found);
+  if(!found.length) return null;
+  found.sort((a, b) =>
+    (b.result.priority - a.result.priority) ||
+    (b.result.lastTs - a.result.lastTs) ||
+    ((b.frameId === 0 ? 1 : 0) - (a.frameId === 0 ? 1 : 0))
+  );
+  const win = found[0];
+  return {
+    tabId: tab.id,
+    frameId: win.frameId,
+    ...win.result,
+    topUrl: topFrame?.url || win.result.url,
+    topTitle: topFrame?.title || win.result.title
+  };
+}
+
+async function writeSmartFieldText(tabId, frameId, token, newText){
+  const [res] = await chrome.scripting.executeScript({
+    target: {tabId, frameIds: [frameId]},
+    args: [token, String(newText ?? "")],
+    func: (tok, value) => {
+      const IGNORED = new Set(["password","hidden","checkbox","radio","file","button","submit","reset","image","range","color","date","time","month","week"]);
+      const isEditable = el => {
+        if(!el || el.nodeType !== 1) return false;
+        const tag = el.tagName?.toLowerCase();
+        if(tag === "textarea") return !el.disabled && !el.readOnly;
+        if(tag === "input") return !IGNORED.has((el.type || "text").toLowerCase()) && !el.disabled && !el.readOnly;
+        return !!el.isContentEditable || ["","true","plaintext-only"].includes(el.getAttribute?.("contenteditable"));
+      };
+      const findMarked = () => {
+        const roots = [document];
+        for(let i = 0; i < roots.length; i++){
+          const root = roots[i];
+          const hit = tok ? root.querySelector(`[data-ai-smart-target="${tok}"]`) : null;
+          if(hit) return hit;
+          for(const host of root.querySelectorAll("*")) if(host.shadowRoot && !roots.includes(host.shadowRoot)) roots.push(host.shadowRoot);
+        }
+        return null;
+      };
+      let el = findMarked();
+      if(!el || !el.isConnected){
+        let a = document.activeElement;
+        while(a && a.shadowRoot && a.shadowRoot.activeElement) a = a.shadowRoot.activeElement;
+        if(isEditable(a)) el = a;
+        else if(window.__aiLastInput && window.__aiLastInput.isConnected && isEditable(window.__aiLastInput)) el = window.__aiLastInput;
+      }
+      if(!el) return {ok:false, msg:"Поле ввода больше недоступно на странице"};
+
+      el.focus();
+      const tag = el.tagName.toLowerCase();
+      if(tag === "input" || tag === "textarea"){
+        const proto = tag === "textarea" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+        const prevVal = el.value;
+        if(setter) setter.call(el, value);
+        else el.value = value;
+        if(el._valueTracker){
+          try{ el._valueTracker.setValue(prevVal === value ? "" : prevVal); }catch{}
+        }
+        try{ el.dispatchEvent(new InputEvent("input", {bubbles:true, cancelable:true, inputType: value ? "insertText" : "deleteContentBackward", data: value || null})); }
+        catch{ el.dispatchEvent(new Event("input", {bubbles:true})); }
+        el.dispatchEvent(new Event("change", {bubbles:true}));
+      } else {
+        try{
+          const sel = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }catch{}
+
+        let applied = false;
+        if(value === ""){
+          try{ applied = document.execCommand("delete", false); }catch{}
+          if((el.innerText || "").trim() !== ""){
+            el.textContent = "";
+            try{ el.dispatchEvent(new InputEvent("input", {bubbles:true, cancelable:true, inputType:"deleteContentBackward", data:null})); }
+            catch{ el.dispatchEvent(new Event("input", {bubbles:true})); }
+          }
+        } else {
+          try{ applied = document.execCommand("insertText", false, value); }catch{}
+          const norm = s => String(s || "").replace(/\r\n/g, "\n").trim();
+          if(!applied || norm(el.innerText) !== norm(value)){
+            try{
+              const dt = new DataTransfer();
+              dt.setData("text/plain", value);
+              el.dispatchEvent(new ClipboardEvent("paste", {bubbles:true, cancelable:true, clipboardData:dt}));
+            }catch{}
+          }
+          if(norm(el.innerText) !== norm(value)){
+            el.textContent = value;
+            try{ el.dispatchEvent(new InputEvent("input", {bubbles:true, cancelable:true, inputType:"insertText", data:value})); }
+            catch{ el.dispatchEvent(new Event("input", {bubbles:true})); }
+          }
+        }
+        el.dispatchEvent(new Event("change", {bubbles:true}));
+      }
+
+      if(el.style){
+        const oldOutline = el.style.outline;
+        el.style.outline = "2px solid #34c77b";
+        setTimeout(() => { el.style.outline = oldOutline; }, 750);
+      }
+      return {ok:true};
+    }
+  });
+  return res?.result || {ok:false, msg:"Не удалось обновить поле ввода"};
+}
+
+async function callSmartFillAI(userContent, signal){
+  const p = settings.provider;
+  const key = settings.keys[p];
+  const model = activeModel();
+  const pDef = providerOf(p);
+  if(!pDef) throw new Error(`Провайдер «${p}» не найден.`);
+  if(!key && !isCustomProvider(p)) throw new Error(`Не указан API-ключ для «${pDef.name}».`);
+  if(!model) throw new Error(`Не выбрана модель для «${pDef.name}».`);
+
+  const body = {
+    model,
+    messages: [
+      {role:"system", content: SMART_FILL_PROMPT},
+      {role:"user", content: userContent}
+    ],
+    stream: false,
+    temperature: 0.4
+  };
+  if(settings.maxTokens) body.max_tokens = +settings.maxTokens;
+  const headers = {"Content-Type":"application/json"};
+  if(key) headers["Authorization"] = "Bearer " + key;
+  if(p === "openrouter"){
+    headers["HTTP-Referer"] = location.origin.startsWith("http") ? location.origin : "https://localhost";
+    headers["X-Title"] = "AI Chat HTML";
+  }
+
+  const MAX_RETRIES = 3;
+  let res;
+  for(let attempt = 0; attempt <= MAX_RETRIES; attempt++){
+    lastApiReqTs = Date.now();
+    res = await fetch(baseUrlOf(p) + "/chat/completions", {
+      method: "POST", headers, body: JSON.stringify(body), signal
+    });
+    if(res.status === 429 && attempt < MAX_RETRIES){
+      let t = await res.text();
+      try{ const j = JSON.parse(t); t = j.error?.message || j.message || t; }catch{}
+      const waitMs = parseRetryDelayMs(res, t, attempt);
+      toast(`⏳ Лимит запросов (429), повтор через ${Math.max(1, Math.ceil(waitMs/1000))} с…`);
+      await abortableSleep(waitMs, signal);
+      continue;
+    }
+    break;
+  }
+  if(!res.ok){
+    let t = await res.text();
+    try{ const j = JSON.parse(t); t = j.error?.message || j.message || t; }catch{}
+    throw new Error(`HTTP ${res.status}: ${String(t).slice(0, 300)}`);
+  }
+  const j = await res.json();
+  if(j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+  const m = j.choices?.[0]?.message || {};
+  return typeof m.content === "string" ? m.content : (m.content || []).map(x => x.text || "").join("");
+}
+
+async function runSmartFill(){
+  if(smartAbort){
+    smartAbort.abort();
+    return {ok:false, error:"Отменено"};
+  }
+  let tab;
+  try{ tab = await getTargetTab(); }catch{}
+  if(!tab || !/^(https?|file):/.test(tab.url || "")){
+    const err = "На этой странице подстановка недоступна";
+    renderSmartUI({error: err});
+    toast(err);
+    return {ok:false, error: err};
+  }
+
+  smartAbort = new AbortController();
+  renderSmartUI({busy: true});
+  try{
+    const info = await collectSmartFieldContext(tab);
+    if(!info){
+      const err = "На странице не найдено активное поле ввода — кликните в нужное поле и повторите";
+      renderSmartUI({error: err});
+      toast("Кликните в поле ввода на странице");
+      return {ok:false, error: err};
+    }
+
+    const panelInputEl = document.getElementById("input");
+    const pageDraft = (info.draft || "").trim();
+    const panelDraft = (panelInputEl?.value || "").trim();
+    const draftText = pageDraft || panelDraft;
+    const draftSource = pageDraft ? "page" : (panelDraft ? "panel" : "empty");
+
+    if(!draftText && !(info.recentMessages && info.recentMessages.length)){
+      const err = "Напишите короткий черновик в поле на странице или в поле боковой панели";
+      renderSmartUI({error: err});
+      toast("Введите короткий черновик");
+      return {ok:false, error: err};
+    }
+
+    const contextLines = [
+      `URL: ${info.topUrl || info.url}`,
+      `Заголовок страницы: ${info.topTitle || info.title}`,
+      info.lang ? `Язык страницы: ${info.lang}` : "",
+      `Поле ввода: ${info.tag}` +
+        (info.placeholder ? ` | placeholder: ${info.placeholder}` : "") +
+        (info.ariaLabel ? ` | label: ${info.ariaLabel}` : ""),
+      info.recentMessages?.length
+        ? `\nПоследние видимые сообщения (${info.recentMessages.length}):\n` + info.recentMessages.map((m, i) => `${i + 1}. ${m}`).join("\n")
+        : "",
+      info.pageSnippet ? `\nФрагмент видимого текста страницы:\n${info.pageSnippet}` : "",
+      draftText
+        ? `\nЧерновик пользователя (${draftSource === "page" ? "из поля на странице" : "из боковой панели"}):\n${draftText}`
+        : "\nЧерновик пользователя пуст: предложи короткий естественный ответ по последним сообщениям диалога."
+    ].filter(Boolean).join("\n");
+
+    const rawReply = await callSmartFillAI(contextLines, smartAbort.signal);
+    const parsed = parseSmartFillResponse(rawReply);
+    if(!parsed.text) throw new Error("Модель вернула пустой текст");
+
+    // Сохраняем исходный черновик до подстановки (для кнопки «Вернуть исходный текст»)
+    smartFillLast = {
+      tabId: info.tabId,
+      frameId: info.frameId,
+      token: info.token,
+      originalFieldText: info.draft || "",
+      draftSource,
+      generatedText: parsed.text,
+      scenario: parsed.scenario,
+      warning: parsed.warning
+    };
+
+    const writeRes = await writeSmartFieldText(info.tabId, info.frameId, info.token, parsed.text);
+    if(!writeRes.ok) throw new Error(writeRes.msg || "Не удалось вставить текст в поле");
+
+    renderSmartUI({scenario: parsed.scenario, warning: parsed.warning, hasUndo: true});
+    toast(parsed.warning ? "✨ Подставлено (есть предупреждение)" : "✨ Текст подставлен в поле");
+    return {ok:true, scenario: parsed.scenario, warning: parsed.warning};
+  }catch(err){
+    if(err.name === "AbortError"){
+      renderSmartUI({busy: false});
+      toast("Умная подстановка отменена");
+      return {ok:false, error:"Отменено"};
+    }
+    const msg = err.message === "Failed to fetch" ? "Нет связи с API (Failed to fetch)" : (err.message || String(err));
+    renderSmartUI({error: msg});
+    return {ok:false, error: msg};
+  }finally{
+    smartAbort = null;
+    const btn = document.getElementById("smartFillBtn");
+    if(btn){ btn.classList.remove("busy"); btn.textContent = "✨ Умная подстановка"; }
+  }
+}
+
+async function undoSmartFill(){
+  if(!smartFillLast) return;
+  const saved = smartFillLast;
+  try{
+    const r = await writeSmartFieldText(saved.tabId, saved.frameId, saved.token, saved.originalFieldText);
+    if(r.ok){
+      smartFillLast = null;
+      renderSmartUI({hasUndo: false});
+      toast("↩️ Исходный текст возвращён");
+      return;
+    }
+  }catch{}
+  try{
+    if(saved.originalFieldText) await navigator.clipboard.writeText(saved.originalFieldText);
+    toast(saved.originalFieldText ? "Поле недоступно — исходный текст скопирован в буфер" : "Поле больше недоступно");
+  }catch{
+    toast("Поле больше недоступно на странице");
+  }
+}
+
+const smartFillBtn = document.getElementById("smartFillBtn");
+if(smartFillBtn) smartFillBtn.onclick = () => runSmartFill();
+const smartUndoBtn = document.getElementById("smartUndoBtn");
+if(smartUndoBtn) smartUndoBtn.onclick = () => undoSmartFill();
+const smartCopyBtn = document.getElementById("smartCopyBtn");
+if(smartCopyBtn) smartCopyBtn.onclick = async () => {
+  if(!smartFillLast?.generatedText) return;
+  try{ await navigator.clipboard.writeText(smartFillLast.generatedText); toast("Скопировано"); }catch{}
+};
+const smartCloseBtn = document.getElementById("smartCloseBtn");
+if(smartCloseBtn) smartCloseBtn.onclick = () => {
+  const card = document.getElementById("smartCard");
+  if(card) card.classList.remove("show");
+};
+
+try{
+  chrome.runtime?.onMessage?.addListener?.((req, sender, sendResponse) => {
+    if(req && req.type === "SMART_FILL_RUN"){
+      runSmartFill().then(sendResponse).catch(e => sendResponse({ok:false, error: e.message || String(e)}));
+      return true;
+    }
+  });
+}catch{}
 
 
 
